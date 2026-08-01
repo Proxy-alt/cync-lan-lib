@@ -457,9 +457,18 @@ async def broadcast_control_command(
     lp: str,
     repeat_op_code: bool = True,
     include_routing: bool = True,
-) -> None:
+) -> bool:
     """Build and broadcast a control packet to the TCP pool, targeting an
     arbitrary `target_id`.
+
+    Returns True if the packet was actually written to at least one session,
+    False if nothing went out - an empty eligible pool, or a pool where every
+    session is in MITM mode and therefore deliberately not written to.
+
+    Callers that only fire and forget can keep ignoring this. It matters to
+    request/response callers, which otherwise sit through their full timeout
+    waiting for a reply to a request that was never transmitted, and then
+    report it as an unanswered query. See _query_hub().
 
     Extracted from CyncDevice.send_command() (a thin wrapper around this,
     always passing target_id=self.id) so commands that don't target a
@@ -482,7 +491,7 @@ async def broadcast_control_command(
         logger.debug(
             f"{lp} no eligible TCP connections available for command broadcast"
         )
-        return
+        return False
 
     tcp_connections: List["CyncTCPSession"] = random.sample(
         tcp_pool,
@@ -542,6 +551,8 @@ async def broadcast_control_command(
 
     if tasks:
         await asyncio.gather(*tasks)
+        return True
+    return False
 
 
 async def set_group_power(group_id: int, state: int) -> None:
@@ -939,6 +950,16 @@ async def delete_group(group_address: int) -> None:
     )
 
 
+# Consecutive unanswered queries, per command name. Used only to keep the
+# timeout warning from repeating forever - see _query_hub().
+_HUB_QUERY_MISSES: Dict[str, int] = {}
+
+# After this many consecutive misses, drop the warning to debug. Small on
+# purpose: if the first few tries all go unanswered, the command family does
+# not work on this hardware and repeating the line adds nothing.
+_HUB_QUERY_MISS_GIVE_UP = 3
+
+
 async def _query_hub(
     op: int, name: str, timeout: float, buffer_len: int
 ) -> Optional[bytes]:
@@ -959,17 +980,51 @@ async def _query_hub(
     payload = bytes(buffer_len)
     cmd_, _hub_routing = _hub_envelope(payload)
     m_cb = ControlMessageCallback(msg_id=0x00, message=None, sent_at=0.0, callback=None)
-    await broadcast_control_command(
+    sent = await broadcast_control_command(
         op, cmd_, 0x00, 0x00, payload, m_cb, lp, include_routing=_hub_routing
     )
 
+    # Nothing went out, so nothing can come back. Waiting the full timeout
+    # here would block the caller for `timeout` seconds and then report the
+    # result as an unanswered query, which reads as a protocol problem when
+    # it is just an empty pool - normal while devices are reconnecting after
+    # a restart, and the reason a Home Assistant hub sensor logged both a
+    # timeout warning and HA's own "taking over 10 seconds" every poll for
+    # the whole reconnect window.
+    if not sent:
+        logger.debug(
+            f"{lp} not sent - no eligible TCP connection, so skipping the "
+            f"{timeout}s wait for a reply"
+        )
+        return None
+
     response = await _await_xlink_notification(op, timeout=timeout)
     if response is None:
-        logger.warning(
+        # Only warn on the transition into failure, not on every poll. These
+        # are polled sensors, so an unsupported command family would
+        # otherwise emit this line forever - measured at ~5,700 lines a day
+        # on real hardware. The state is still visible at debug level.
+        misses = _HUB_QUERY_MISSES.get(name, 0) + 1
+        _HUB_QUERY_MISSES[name] = misses
+        message = (
             f"{lp} No response within {timeout}s - either this notification "
             f"channel doesn't ride the TCP relay cync-lan intercepts, or no "
             f"connected device answered."
         )
+        if misses == 1:
+            logger.warning(message)
+        elif misses == _HUB_QUERY_MISS_GIVE_UP:
+            logger.warning(
+                f"{message} This has now failed {misses} times in a row, so "
+                f"further failures will be logged at debug level only. This "
+                f"command family is experimental and its transport is "
+                f"unconfirmed; if it never answers on your hardware, disable "
+                f"the entity that polls it."
+            )
+        else:
+            logger.debug(f"{message} (consecutive failures: {misses})")
+    elif _HUB_QUERY_MISSES.pop(name, 0):
+        logger.info(f"{lp} answered again after previously timing out")
     return response
 
 

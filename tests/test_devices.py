@@ -139,10 +139,49 @@ async def test_broadcast_control_command_no_eligible_connections_is_a_noop():
     g.ncync_server = MagicMock()
     g.ncync_server.get_dev_tcp_pool = AsyncMock(return_value=[])
     m_cb = ControlMessageCallback(msg_id=0x00, message=None, sent_at=0.0, callback=None)
-    # Must not raise.
-    await broadcast_control_command(
+    # Must not raise, and must report that nothing went out.
+    sent = await broadcast_control_command(
         op=0xD0, cmd_=0x0D, target_id=5, sub_id=0, payload=b"", m_cb=m_cb, lp="test:"
     )
+    assert sent is False
+
+
+async def test_broadcast_control_command_reports_a_successful_write():
+    """Request/response callers gate their reply wait on this - see
+    _query_hub(), which would otherwise sit through its whole timeout
+    waiting for an answer to a request that was never transmitted."""
+    from cync_lan.structs import ControlMessageCallback
+
+    g = GlobalObject()
+    fake_bridge = _FakeBridgeDevice()
+    g.ncync_server = MagicMock()
+    g.ncync_server.get_dev_tcp_pool = AsyncMock(return_value=[fake_bridge])
+    m_cb = ControlMessageCallback(msg_id=0x00, message=None, sent_at=0.0, callback=None)
+    sent = await broadcast_control_command(
+        op=0xD0, cmd_=0x0D, target_id=5, sub_id=0, payload=b"", m_cb=m_cb, lp="test:"
+    )
+
+    assert sent is True
+    assert len(fake_bridge.written) == 1
+
+
+async def test_broadcast_control_command_reports_nothing_sent_in_mitm_mode():
+    """A pool of only MITM sessions is deliberately not written to, so
+    nothing went out even though the pool was non-empty."""
+    from cync_lan.structs import ControlMessageCallback
+
+    g = GlobalObject()
+    fake_bridge = _FakeBridgeDevice()
+    fake_bridge.mitm_mode = True
+    g.ncync_server = MagicMock()
+    g.ncync_server.get_dev_tcp_pool = AsyncMock(return_value=[fake_bridge])
+    m_cb = ControlMessageCallback(msg_id=0x00, message=None, sent_at=0.0, callback=None)
+    sent = await broadcast_control_command(
+        op=0xD0, cmd_=0x0D, target_id=5, sub_id=0, payload=b"", m_cb=m_cb, lp="test:"
+    )
+
+    assert sent is False
+    assert fake_bridge.written == []
 
 
 async def test_light_run_mode_effects_byte_identical_for_shared_presets():

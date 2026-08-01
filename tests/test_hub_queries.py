@@ -20,6 +20,26 @@ from cync_lan.packet import PacketBuilder
 from cync_lan.structs import GlobalObject
 
 
+@pytest.fixture(autouse=True)
+def _reset_miss_counters():
+    """The consecutive-miss counters are module-global, so a test that times
+    out would otherwise change how the next one logs."""
+    devices._HUB_QUERY_MISSES.clear()
+    yield
+    devices._HUB_QUERY_MISSES.clear()
+
+
+@pytest.fixture
+def no_tcp_pool(monkeypatch):
+    """A server with no eligible sessions - nothing can be sent."""
+    g = GlobalObject()
+    prev = g.ncync_server
+    g.ncync_server = MagicMock()
+    g.ncync_server.get_dev_tcp_pool = AsyncMock(return_value=[])
+    yield
+    g.ncync_server = prev
+
+
 @pytest.fixture
 def sent(monkeypatch):
     """Capture what each command puts on the wire."""
@@ -189,3 +209,59 @@ async def test_every_query_sends_an_all_zero_request(sent):
         await coro
     for call in sent:
         assert call["command_payload"] == bytes(64)
+
+
+# ---------------------------------------------------------------------------
+# nothing sent / repeated misses
+# ---------------------------------------------------------------------------
+
+
+async def test_query_gives_up_immediately_when_nothing_was_sent(no_tcp_pool):
+    """With no eligible session the request never goes out, so there is
+    nothing to wait for. Waiting the full timeout here blocked a polled Home
+    Assistant sensor for 10s every poll while devices were reconnecting."""
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    result = await devices.query_device_time(timeout=30)
+    elapsed = loop.time() - started
+
+    assert result is None
+    assert elapsed < 1, f"waited {elapsed:.2f}s for a request that was never sent"
+
+
+async def test_nothing_sent_is_not_reported_as_an_unanswered_query(
+    no_tcp_pool, caplog
+):
+    """An empty pool is a local condition, not evidence about the transport."""
+    with caplog.at_level("DEBUG", logger=devices.logger.name):
+        await devices.query_device_time(timeout=0.05)
+
+    assert not [r for r in caplog.records if r.levelname == "WARNING"]
+    assert devices._HUB_QUERY_MISSES == {}
+
+
+async def test_repeated_timeouts_warn_once_then_drop_to_debug(sent, caplog):
+    """These are polled, so an unsupported command family would otherwise
+    warn forever - ~5,700 lines a day on real hardware."""
+    with caplog.at_level("DEBUG", logger=devices.logger.name):
+        for _ in range(6):
+            assert await devices.query_device_time(timeout=0.01) is None
+
+    warnings = [
+        r for r in caplog.records if r.levelname == "WARNING" and "No response" in r.message
+    ]
+    # One on the first miss, one more announcing the switch to debug.
+    assert len(warnings) == 2
+    assert "logged at debug level only" in warnings[1].message
+    assert devices._HUB_QUERY_MISSES["query_device_time"] == 6
+
+
+async def test_a_later_success_resets_the_miss_counter(sent):
+    assert await devices.query_device_time(timeout=0.01) is None
+    assert devices._HUB_QUERY_MISSES["query_device_time"] == 1
+
+    task = asyncio.create_task(devices.query_device_time(timeout=2))
+    await _reply(0x46, struct.pack("<H", 2026) + bytes([8, 1, 3, 30, 0]))
+    assert await task == datetime.datetime(2026, 8, 1, 3, 30, 0)
+
+    assert "query_device_time" not in devices._HUB_QUERY_MISSES
