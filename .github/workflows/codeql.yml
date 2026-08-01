@@ -6,9 +6,9 @@ name: CodeQL
 # default setup would also analyse test fixtures and vendored code.
 on:
   push:
-    branches: [core]
+    branches: [main]
   pull_request:
-    branches: [core]
+    branches: [main]
   schedule:
     # Weekly. CodeQL's query packs are updated independently of this code, so a
     # scheduled run catches newly-published queries against unchanged source -

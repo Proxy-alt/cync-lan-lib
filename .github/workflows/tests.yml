@@ -9,7 +9,7 @@ name: Tests
 on:
   push:
     branches:
-      - core
+      - main
   pull_request:
   workflow_dispatch:
 

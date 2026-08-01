@@ -32,7 +32,7 @@ name: Release + PyPI publish - core package
 on:
   push:
     branches:
-      - core
+      - main
     paths:
       - "pyproject.toml"
   workflow_dispatch:
@@ -94,11 +94,12 @@ jobs:
         run: |
           version="${{ steps.version.outputs.version }}"
           if [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            # --latest=false: three independently-versioned artifacts share
-            # this repo's release list, and Latest belongs to the HA
-            # integration (the one HACS surfaces), not to whichever tag is
-            # newest by date.
-            echo "flags=--latest=false" >> "$GITHUB_OUTPUT"
+            # This library is the only artifact released from this
+            # repository, so its newest release is unambiguously Latest.
+            # This was --latest=false while the core library, the MQTT
+            # add-on and the HA integration all shared one release list in
+            # Proxy-alt/cync-lan - see RELEASING.md for why that split.
+            echo "flags=--latest" >> "$GITHUB_OUTPUT"
             echo "kind=release" >> "$GITHUB_OUTPUT"
             echo "discussion=--discussion-category Announcements" >> "$GITHUB_OUTPUT"
           elif [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+b[0-9]+$ ]]; then
