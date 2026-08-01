@@ -229,9 +229,7 @@ async def test_query_gives_up_immediately_when_nothing_was_sent(no_tcp_pool):
     assert elapsed < 1, f"waited {elapsed:.2f}s for a request that was never sent"
 
 
-async def test_nothing_sent_is_not_reported_as_an_unanswered_query(
-    no_tcp_pool, caplog
-):
+async def test_nothing_sent_is_not_reported_as_an_unanswered_query(no_tcp_pool, caplog):
     """An empty pool is a local condition, not evidence about the transport."""
     with caplog.at_level("DEBUG", logger=devices.logger.name):
         await devices.query_device_time(timeout=0.05)
@@ -248,7 +246,9 @@ async def test_repeated_timeouts_warn_once_then_drop_to_debug(sent, caplog):
             assert await devices.query_device_time(timeout=0.01) is None
 
     warnings = [
-        r for r in caplog.records if r.levelname == "WARNING" and "No response" in r.message
+        r
+        for r in caplog.records
+        if r.levelname == "WARNING" and "No response" in r.message
     ]
     # One on the first miss, one more announcing the switch to debug.
     assert len(warnings) == 2
