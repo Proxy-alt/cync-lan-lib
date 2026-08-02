@@ -302,7 +302,9 @@ def _telink_reply(op_code: int, params: bytes):
 
 
 def _time_params(year=2026, month=8, day=1, hour=3, minute=30, second=15):
-    return struct.pack("<H", year) + bytes([month, day, hour, minute, second, 0xA1, 0x05, 0x00])
+    return struct.pack("<H", year) + bytes(
+        [month, day, hour, minute, second, 0xA1, 0x05, 0x00]
+    )
 
 
 async def test_query_device_time_defaults_to_the_mesh_relay_form(sent):
