@@ -137,8 +137,9 @@ async def test_query_hub_info_decodes_four_fixed_fields(sent):
 
 
 async def test_query_device_time_decodes_the_xlink_layout(sent):
+    """The Xlink layout belongs to the Sol / C-Reach branch specifically."""
     payload = struct.pack("<H", 2026) + bytes([7, 25, 14, 30, 5])
-    task = asyncio.create_task(devices.query_device_time(timeout=2))
+    task = asyncio.create_task(devices.query_device_time(timeout=2, hub_product=True))
     await _reply(0x46, payload)
     result = await task
 
@@ -149,7 +150,7 @@ async def test_query_device_time_decodes_the_xlink_layout(sent):
 async def test_query_device_time_rejects_an_impossible_date(sent):
     """A hub with a corrupt clock must not raise out of a diagnostic read."""
     payload = struct.pack("<H", 2026) + bytes([13, 45, 99, 99, 99])
-    task = asyncio.create_task(devices.query_device_time(timeout=2))
+    task = asyncio.create_task(devices.query_device_time(timeout=2, hub_product=True))
     await _reply(0x46, payload)
 
     assert await task is None
@@ -178,8 +179,12 @@ async def test_query_sol_config_decodes_three_booleans(sent):
 )
 async def test_queries_return_none_on_timeout(sent, fn, op_code):
     """A timeout is an expected outcome, not an error - whether this
-    notification channel rides the intercepted TCP relay is unresolved."""
-    assert await getattr(devices, fn)(timeout=0.05) is None
+    notification channel rides the intercepted TCP relay is unresolved.
+
+    query_device_time is pinned to its hub_product branch here; its default
+    branch has its own timeout coverage below."""
+    kwargs = {"hub_product": True} if fn == "query_device_time" else {}
+    assert await getattr(devices, fn)(timeout=0.05, **kwargs) is None
     assert sent[0]["op_code"] == op_code
 
 
@@ -192,7 +197,8 @@ async def test_queries_return_none_on_timeout(sent, fn, op_code):
     ],
 )
 async def test_queries_return_none_on_a_short_reply(sent, fn, op_code, short):
-    task = asyncio.create_task(getattr(devices, fn)(timeout=2))
+    kwargs = {"hub_product": True} if fn == "query_device_time" else {}
+    task = asyncio.create_task(getattr(devices, fn)(timeout=2, **kwargs))
     await _reply(op_code, short)
 
     assert await task is None
@@ -203,7 +209,7 @@ async def test_every_query_sends_an_all_zero_request(sent):
     the wire size."""
     for coro in (
         devices.query_hub_info(timeout=0.05),
-        devices.query_device_time(timeout=0.05),
+        devices.query_device_time(timeout=0.05, hub_product=True),
         devices.query_sol_config(timeout=0.05),
     ):
         await coro
@@ -257,11 +263,101 @@ async def test_repeated_timeouts_warn_once_then_drop_to_debug(sent, caplog):
 
 
 async def test_a_later_success_resets_the_miss_counter(sent):
-    assert await devices.query_device_time(timeout=0.01) is None
+    assert await devices.query_device_time(timeout=0.01, hub_product=True) is None
     assert devices._HUB_QUERY_MISSES["query_device_time"] == 1
 
-    task = asyncio.create_task(devices.query_device_time(timeout=2))
+    task = asyncio.create_task(devices.query_device_time(timeout=2, hub_product=True))
     await _reply(0x46, struct.pack("<H", 2026) + bytes([8, 1, 3, 30, 0]))
     assert await task == datetime.datetime(2026, 8, 1, 3, 30, 0)
 
     assert "query_device_time" not in devices._HUB_QUERY_MISSES
+
+
+# ---------------------------------------------------------------------------
+# query_device_time: the 0x8E / 0xE8 branch
+#
+# QueryDeviceTimeCommand.N() branches on ProductType.f31219d, true only for
+# Sol and CReach. Everything else takes the mesh-relay branch, which is what
+# these pin.
+# ---------------------------------------------------------------------------
+
+
+def _telink_reply(op_code: int, params: bytes):
+    """Resolve a pending Telink wait as if the mesh had answered.
+
+    Wraps params in the frame shape the resolver scans for: opcode, then the
+    0x11 0x02 vendor id, then par[0..9].
+    """
+
+    async def _resolve():
+        for _ in range(50):
+            fut = devices._PENDING_TELINK_NOTIFICATIONS.get(op_code)
+            if fut is not None and not fut.done():
+                frame = bytes([0, 0, 0, 0, 0, 0, 0, op_code]) + b"\x11\x02" + params
+                assert devices.try_resolve_telink_notification(frame) is True
+                return
+            await asyncio.sleep(0)
+
+    return _resolve()
+
+
+def _time_params(year=2026, month=8, day=1, hour=3, minute=30, second=15):
+    return struct.pack("<H", year) + bytes([month, day, hour, minute, second, 0xA1, 0x05, 0x00])
+
+
+async def test_query_device_time_defaults_to_the_mesh_relay_form(sent):
+    """0x46 is correct only for a Sol lamp or C-Reach hub. The default has to
+    be the branch every other product takes."""
+    task = asyncio.create_task(devices.query_device_time(timeout=2))
+    await _telink_reply(devices.TELINK_NOTIFY_QUERY_TIME, _time_params())
+
+    assert await task == datetime.datetime(2026, 8, 1, 3, 30, 15)
+    assert sent[0]["op_code"] == 0x8E
+    assert sent[0]["command_payload"] == bytes([0xE8, 0x11, 0x02, 0x10])
+    # cmd_ is 7 + len(payload), as for every other 0x8E command here.
+    assert sent[0]["cmd_code"] == 0x0B
+    assert sent[0]["repeat_op_code"] is False
+
+
+async def test_query_device_time_uses_the_hub_envelope_only_when_asked(sent):
+    """hub_product=True is the Sol / C-Reach branch."""
+    task = asyncio.create_task(devices.query_device_time(timeout=2, hub_product=True))
+    await _reply(0x46, struct.pack("<H", 2026) + bytes([8, 1, 3, 30, 15]))
+
+    assert await task == datetime.datetime(2026, 8, 1, 3, 30, 15)
+    assert sent[0]["op_code"] == 0x46
+
+
+async def test_telink_resolver_finds_the_frame_by_vendor_id(sent):
+    """Located by the 0x11 0x02 vendor id rather than a fixed offset, so a
+    real relayed packet with a wrapper in front of it still resolves. Prefix
+    below is from a captured 0x83."""
+    task = asyncio.create_task(devices.query_device_time(timeout=2))
+    for _ in range(50):
+        if devices._PENDING_TELINK_NOTIFICATIONS.get(devices.TELINK_NOTIFY_QUERY_TIME):
+            break
+        await asyncio.sleep(0)
+    packet = (
+        bytes.fromhex("1e 00 00 00 fa db 13 00 15 35 11 b7 00 b7 00".replace(" ", ""))
+        + bytes([devices.TELINK_NOTIFY_QUERY_TIME])
+        + b"\x11\x02"
+        + _time_params()
+    )
+    assert devices.try_resolve_telink_notification(packet) is True
+    assert await task == datetime.datetime(2026, 8, 1, 3, 30, 15)
+
+
+async def test_telink_resolver_ignores_frames_nobody_awaits(sent):
+    frame = bytes([0, 0xE9]) + b"\x11\x02" + _time_params()
+    assert devices.try_resolve_telink_notification(frame) is False
+
+
+async def test_telink_resolver_ignores_a_truncated_parameter_block(sent):
+    task = asyncio.create_task(devices.query_device_time(timeout=0.2))
+    for _ in range(50):
+        if devices._PENDING_TELINK_NOTIFICATIONS.get(devices.TELINK_NOTIFY_QUERY_TIME):
+            break
+        await asyncio.sleep(0)
+    short = bytes([0, devices.TELINK_NOTIFY_QUERY_TIME]) + b"\x11\x02" + b"\x01\x02"
+    assert devices.try_resolve_telink_notification(short) is False
+    assert await task is None

@@ -72,6 +72,7 @@ __all__ = [
     "query_hub_mesh_credentials",
     "create_schedule",
     "add_automation",
+    "try_resolve_telink_notification",
     "try_resolve_xlink_notification",
 ]
 logger = logging.getLogger(CYNC_LOG_NAME)
@@ -392,6 +393,85 @@ def _get_xlink_response_lock(op_code: int) -> asyncio.Lock:
     if lock is None:
         lock = _XLINK_RESPONSE_LOCKS[op_code] = asyncio.Lock()
     return lock
+
+
+# --- relayed Telink mesh notifications -------------------------------------
+#
+# A second, structurally unrelated reply channel to the Xlink/HDLC one above.
+# Commands that go out as the 0x8E mesh-relay family are answered by a Telink
+# mesh notification relayed back over the same TCP session, not by an HDLC
+# frame - so they need their own pending-response table.
+#
+# The app's own notification registry is
+# `services/devices/telink/NotificationType.java`, which maps a single opcode
+# byte to a parser: QUERY_TIME is `(byte) -23` = 0xE9, answering the 0xE8
+# request. Request/response there is op and op+1.
+#
+# Frame layout is Telink's standard `sno[3] src[2] dst[2] op vendor[2]
+# par[10]`, which is why every parser in that registry reads its fields from
+# offset 10 onwards - offset 10 is par[0].
+#
+# Rather than assume a fixed offset into whatever wrapper the relay used, the
+# resolver below finds the two-byte vendor id and works outwards from it. That
+# is what a real captured packet supports: an 0x83 whose inner data ran
+# `1e 00 00 00 fa db 13 00 15 35 11 b7 00 b7 00 db 11 02 01 00 ...`, where the
+# Telink frame starts 8 bytes in, `db` is the opcode and `11 02` the vendor id.
+_TELINK_VENDOR_ID = b"\x11\x02"
+_TELINK_PARAM_COUNT = 10
+
+# NotificationType.QUERY_TIME - answers the 0xE8 query_device_time request.
+TELINK_NOTIFY_QUERY_TIME = 0xE9
+
+_PENDING_TELINK_NOTIFICATIONS: Dict[int, "asyncio.Future"] = {}
+_TELINK_NOTIFICATION_LOCKS: Dict[int, asyncio.Lock] = {}
+
+
+def _get_telink_notification_lock(op_code: int) -> asyncio.Lock:
+    lock = _TELINK_NOTIFICATION_LOCKS.get(op_code)
+    if lock is None:
+        lock = _TELINK_NOTIFICATION_LOCKS[op_code] = asyncio.Lock()
+    return lock
+
+
+def try_resolve_telink_notification(packet_data: bytes) -> bool:
+    """Sibling of try_resolve_xlink_notification for the 0x8E mesh-relay
+    reply channel, called from the same "unknown ctrl_bytes" fallbacks.
+
+    Locates the Telink vendor id (0x11 0x02) and reads the opcode from the
+    byte before it and the 10 parameter bytes from after it. Resolves a
+    pending wait registered for that opcode, if any.
+
+    Returns True only when a frame was both recognised AND consumed by a
+    waiter, so callers fall through to their existing unknown-packet logging
+    in every other case - this never suppresses diagnostic visibility.
+    """
+    idx = packet_data.find(_TELINK_VENDOR_ID)
+    # Need one byte before for the opcode and the full parameter block after.
+    if idx < 1 or len(packet_data) < idx + 2 + _TELINK_PARAM_COUNT:
+        return False
+    op_code = packet_data[idx - 1]
+    fut = _PENDING_TELINK_NOTIFICATIONS.get(op_code)
+    if fut is None or fut.done():
+        return False
+    params = packet_data[idx + 2 : idx + 2 + _TELINK_PARAM_COUNT]
+    fut.set_result(params)
+    return True
+
+
+async def _await_telink_notification(
+    op_code: int, timeout: float = 10.0
+) -> Optional[bytes]:
+    """Wait for a relayed Telink notification with this opcode, returning its
+    10 parameter bytes, or None on timeout."""
+    async with _get_telink_notification_lock(op_code):
+        fut: "asyncio.Future" = asyncio.get_event_loop().create_future()
+        _PENDING_TELINK_NOTIFICATIONS[op_code] = fut
+        try:
+            return await asyncio.wait_for(fut, timeout=timeout)
+        except asyncio.TimeoutError:
+            return None
+        finally:
+            _PENDING_TELINK_NOTIFICATIONS.pop(op_code, None)
 
 
 def try_resolve_xlink_notification(packet_data: bytes) -> bool:
@@ -1059,40 +1139,134 @@ async def query_hub_info(timeout: float = 10.0) -> Optional[Dict[str, str]]:
     }
 
 
-async def query_device_time(timeout: float = 10.0) -> Optional[datetime.datetime]:
-    """EXPERIMENTAL: read the clock a hub believes it is running on.
+async def query_device_time(
+    timeout: float = 10.0, hub_product: bool = False
+) -> Optional[datetime.datetime]:
+    """Read the clock a device believes it is running on.
 
     Worth having because native Cync Schedules fire off this clock, not off
-    Home Assistant's - a hub whose time has drifted runs its automations at
-    the wrong moment, and nothing else exposes that.
+    Home Assistant's - a device whose time has drifted runs its automations
+    at the wrong moment, and nothing else exposes that.
 
-    Confirmed via QueryDeviceTimeCommand.java (op_code (byte)70 = 0x46, empty
-    64-byte request). Response (DeviceTimeNotification.XlinkParser): year as
-    a 2-byte little-endian int, then month, day, hour, minute and second as
-    single bytes - 7 bytes.
+    There are two entirely different ways to ask, and which one is correct
+    depends on the product. QueryDeviceTimeCommand.N() branches on
+    `getDeviceType().getProductType().f31219d`:
 
-    Note the app has a SECOND parser for this same notification on its
-    Telink/BLE-direct path, reading a different layout at offsets 10-19 with
-    a DST flag and a packed UTC offset. Only the Xlink layout above applies
-    to this TCP path; the two are not interchangeable.
+        if (!...f31219d) { DefaultImpls.c(TELINK_OPCODE_BYTES, ...) }   <- 0x8E
+        ... else WriteBuffer(64) + XlinkTranslator.a(msgId, (byte) 70)  <- 0x46
 
-    Returned naive - the reply carries no timezone on this path.
+    and that flag is the last argument of ProductType's constructor, set true
+    for exactly two entries:
+
+        new ProductType("Sol",    15, "Sol",     false, groupPolicy,  true)
+        new ProductType("CReach", 16, "C-Reach", false, groupPolicy4, true)
+
+    Every other product - Light, Plug, Switch, FanSpeedSwitch, Downlight, the
+    strips - is false and takes the 0x8E branch. So the 0x46 hub-envelope
+    form this used to send unconditionally is correct only for a Sol lamp or
+    a C-Reach hub, and silently unanswered on everything else. Pass
+    hub_product=True for those two; the default is the branch that covers
+    every other device.
+
+    The 0x8E branch sends the Companion's TELINK_OPCODE_BYTES, which decode
+    as `E8 11 02 10` - opcode 0xE8, Telink vendor id 0x1102, one parameter -
+    and is answered by notification opcode 0xE9
+    (NotificationType.QUERY_TIME). Its reply is the Telink layout, read from
+    par[0] onwards: year as a 2-byte little-endian int, then month, day,
+    hour, minute, second, then a DST marker and a packed UTC offset.
+
+    The 0x46 branch is answered by DeviceTimeNotification.XlinkParser
+    instead: the same year/month/day/hour/minute/second, but no DST or
+    offset. The two layouts are not interchangeable.
+
+    Returned naive in both cases - the offset the Telink layout carries is
+    the device's configured UTC offset, not a timezone, and applying it here
+    would silently reinterpret the wall-clock reading the caller wants.
     """
-    response = await _query_hub(0x46, "query_device_time", timeout, 64)
-    if response is None:
-        return None
-    if len(response) < 7:
-        logger.error(
-            f"query_device_time: malformed response (expected >=7 bytes, got {len(response)})"
-        )
-        return None
-    year = struct.unpack_from("<H", response, 0)[0]
-    month, day, hour, minute, second = response[2:7]
+    if hub_product:
+        response = await _query_hub(0x46, "query_device_time", timeout, 64)
+        if response is None:
+            return None
+        if len(response) < 7:
+            logger.error(
+                f"query_device_time: malformed response (expected >=7 bytes, got {len(response)})"
+            )
+            return None
+        year = struct.unpack_from("<H", response, 0)[0]
+        month, day, hour, minute, second = response[2:7]
+    else:
+        params = await _query_device_time_telink(timeout)
+        if params is None:
+            return None
+        year = struct.unpack_from("<H", params, 0)[0]
+        month, day, hour, minute, second = params[2:7]
+
     try:
         return datetime.datetime(year, month, day, hour, minute, second)
     except ValueError as err:
-        logger.error(f"query_device_time: hub reported an invalid date/time: {err}")
+        logger.error(f"query_device_time: device reported an invalid date/time: {err}")
         return None
+
+
+async def _query_device_time_telink(timeout: float) -> Optional[bytes]:
+    """Send query_device_time the way the app sends it to everything that is
+    not a Sol lamp or a C-Reach hub, and return the reply's parameter bytes.
+
+    op 0x8E with repeat_op_code=False is the mesh-relay envelope already
+    proven on hardware for the rest of this family (indicator LED, motion
+    sensor settings, scenes) - see set_indicator_led for how that op was
+    established. cmd_ is 7 + len(payload), consistent with every other 0x8E
+    command here: 5 bytes -> 0x0C, 7 -> 0x0E, 13 -> 0x14, so 4 -> 0x0B.
+
+    Broadcast rather than addressed to one device, which the app permits for
+    this command specifically: the "doesn't support non-self destination"
+    guard in DeviceServiceDefault.sendBroadcastCommand() keys off
+    DeviceCommand.m(), and QueryDeviceTimeCommand leaves that false.
+    QueryHubInfoCommand and QueryHubMeshNameAndPasswordCommand both set it
+    true, which is why those two cannot be broadcast the way this one can.
+    """
+    lp = "query_device_time:"
+    payload = bytes([0xE8, 0x11, 0x02, 0x10])
+    m_cb = ControlMessageCallback(msg_id=0x00, message=None, sent_at=0.0, callback=None)
+    sent = await broadcast_control_command(
+        0x8E,
+        7 + len(payload),
+        0x00,
+        0x00,
+        payload,
+        m_cb,
+        lp,
+        repeat_op_code=False,
+    )
+    if not sent:
+        logger.debug(
+            f"{lp} not sent - no eligible TCP connection, so skipping the "
+            f"{timeout}s wait for a reply"
+        )
+        return None
+
+    params = await _await_telink_notification(TELINK_NOTIFY_QUERY_TIME, timeout)
+    if params is None:
+        misses = _HUB_QUERY_MISSES.get("query_device_time", 0) + 1
+        _HUB_QUERY_MISSES["query_device_time"] = misses
+        message = (
+            f"{lp} No response within {timeout}s to the 0x8E/0xE8 form. "
+            f"Expected notification opcode "
+            f"0x{TELINK_NOTIFY_QUERY_TIME:02X} did not arrive."
+        )
+        if misses == 1:
+            logger.warning(message)
+        elif misses == _HUB_QUERY_MISS_GIVE_UP:
+            logger.warning(
+                f"{message} This has now failed {misses} times in a row, so "
+                f"further failures will be logged at debug level only."
+            )
+        else:
+            logger.debug(f"{message} (consecutive failures: {misses})")
+        return None
+
+    _HUB_QUERY_MISSES.pop("query_device_time", None)
+    return params
 
 
 async def query_sol_config(timeout: float = 10.0) -> Optional[Dict[str, bool]]:
@@ -3983,6 +4157,13 @@ class CyncTCPSession:
                             f"{checksum == calc_chksum}), safe to ignore\n\nHEX: "
                             f"{packet_data[1:-1].hex(' ')}\nINT: {list(packet_data[1:-1])}"
                         )
+                elif try_resolve_telink_notification(packet_data):
+                    # A relayed Telink mesh notification answering one of the
+                    # 0x8E mesh-relay commands - e.g. the 0xE9 reply to
+                    # query_device_time. Structurally unrelated to the
+                    # Xlink/HDLC channel checked below; identified by the
+                    # 0x11 0x02 vendor id rather than a 0x7E frame.
+                    pass
                 elif try_resolve_xlink_notification(packet_data):
                     # A legacy Xlink/Frame HDLC notification (see
                     # try_resolve_xlink_notification's docstring) - e.g. the
@@ -4233,6 +4414,13 @@ class CyncTCPSession:
                         except Exception as e:
                             logger.debug(f"{lp} Exception during firmware parsing: {e}")
 
+                elif try_resolve_telink_notification(packet_data):
+                    # A relayed Telink mesh notification answering one of the
+                    # 0x8E mesh-relay commands - e.g. the 0xE9 reply to
+                    # query_device_time. Structurally unrelated to the
+                    # Xlink/HDLC channel checked below; identified by the
+                    # 0x11 0x02 vendor id rather than a 0x7E frame.
+                    pass
                 elif try_resolve_xlink_notification(packet_data):
                     # See the identical branch in _handle_83_packet - a
                     # legacy Xlink/Frame HDLC notification landed here
