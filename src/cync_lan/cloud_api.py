@@ -275,7 +275,7 @@ class CyncCloudAPI:
         auth_data = {
             "corp_id": CYNC_CORP_ID,
             "email": CYNC_ACCOUNT_USERNAME,
-            "password": CYNC_ACCOUNT_PASSWORD,
+            "password": CYNC_ACCOUNT_PASSWORD[:16],
             "two_factor": otp_code,
             "resource": "".join(random.choices(string.ascii_lowercase, k=16)),
         }
