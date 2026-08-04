@@ -1591,3 +1591,63 @@ async def test_parse_83_device_state_records_relay_source():
 
     assert node.relay_source is session
     node.handle_entity_update.assert_awaited_once()
+
+
+async def test_mesh_info_flags_a_sub_element_address_instead_of_truncating(caplog):
+    """The mesh address is 16 bits, and only the low byte was being read.
+
+    `MeshAddress` is `base_address | (element_id << 8)` and the app parses the
+    whole field (`DataBytes.d(0)`, little-endian). Every device seen so far
+    carries element 0, so reading one byte has been correct by luck - but a
+    multi-gang device using the high byte would have all of its gangs collapse
+    silently onto the parent id. Per-element addressing still is not
+    implemented; the requirement is that it stops being invisible.
+    """
+    import logging
+
+    g = GlobalObject()
+    g.ncync_server = MagicMock()
+    g.ncync_server.node_devices = {}
+    g.mqtt_client = MagicMock()
+
+    entry = bytearray(24)
+    entry[0] = 5  # base address
+    entry[1] = 3  # sub-element - the byte that was being dropped
+    inner = bytearray(14) + entry
+    inner[8] = 1  # devices in this packet
+    inner[12] = 1  # devices in total
+
+    session = _fake_session()
+    with caplog.at_level(logging.WARNING):
+        await session._process_73_mesh_info(
+            bytes(inner), queue_id=b"\x00\x01\x02\x03", lp="t:", send_ack=False
+        )
+
+    assert "sub-element 3" in caplog.text
+    assert "0x0305" in caplog.text, "the full 16-bit address should be reported"
+
+
+async def test_mesh_info_stays_quiet_for_ordinary_single_element_devices(caplog):
+    """The warning must not fire for the entire real world - element 0 means
+    'no sub-element', which is every device on the development account."""
+    import logging
+
+    g = GlobalObject()
+    g.ncync_server = MagicMock()
+    g.ncync_server.node_devices = {}
+    g.mqtt_client = MagicMock()
+
+    entry = bytearray(24)
+    entry[0] = 5
+    entry[1] = 0
+    inner = bytearray(14) + entry
+    inner[8] = 1
+    inner[12] = 1
+
+    session = _fake_session()
+    with caplog.at_level(logging.WARNING):
+        await session._process_73_mesh_info(
+            bytes(inner), queue_id=b"\x00\x01\x02\x03", lp="t:", send_ack=False
+        )
+
+    assert "sub-element" not in caplog.text

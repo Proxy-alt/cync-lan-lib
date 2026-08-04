@@ -4488,7 +4488,18 @@ class CyncTCPSession:
             if len(mesh_dev_struct) < minfo_length:
                 break
 
+            # The address is 16-bit little-endian, not one byte: the app reads
+            # it as `DataBytes.d(0)` and wraps it in MeshAddress, which is
+            # `base_address | (element_id << 8)` (MeshAddress.Companion.a(),
+            # base 1-254, element 0-126, 0 meaning "no sub-element").
+            #
+            # Reading only the low byte is correct for every device seen so
+            # far, because they all carry element 0 - but it is correct by
+            # luck rather than by construction, and a multi-gang device using
+            # the high byte would silently collapse all of its gangs onto one
+            # id. Parse the whole field so that case is visible instead.
             dev_id = mesh_dev_struct[0]
+            element_id = mesh_dev_struct[1]
             entry_len = minfo_length
 
             if dev_id == 0:
@@ -4514,8 +4525,23 @@ class CyncTCPSession:
                         )
                         mesh_dev_struct = shifted
                         dev_id = shifted[0]
+                        element_id = shifted[1]
                         entry_len = minfo_length + shift
                         break
+
+            if element_id:
+                # Never observed on this hardware. Log it rather than truncate
+                # silently - the reading below is the parent device's, so the
+                # per-gang detail is being dropped, and that should be visible
+                # to whoever first meets a device that uses it.
+                logger.warning(
+                    f"{lp}mesh: device {dev_id} reported sub-element "
+                    f"{element_id} (full address "
+                    f"0x{dev_id | (element_id << 8):04x}). Per-element "
+                    "addressing is not implemented; reporting this entry "
+                    "against the parent device. Please open an issue with "
+                    "your device model - this needs real hardware to finish."
+                )
 
             dev_type_id = mesh_dev_struct[2]
             dev_state, dev_bri, dev_tmp = (
