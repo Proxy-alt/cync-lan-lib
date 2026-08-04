@@ -12,7 +12,13 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
 
-from cync_lan.const import CYNC_LOG_NAME, CYNC_SRV_HOST, CYNC_SRV_PORT
+from cync_lan.const import (
+    CYNC_FIRMWARE_CAPTURE_DIR,
+    CYNC_FIRMWARE_CHECK_INTERVAL,
+    CYNC_LOG_NAME,
+    CYNC_SRV_HOST,
+    CYNC_SRV_PORT,
+)
 from cync_lan.devices import CyncDevice, CyncTCPSession
 from cync_lan.structs import GlobalObject
 
@@ -109,6 +115,9 @@ class nCyncServer:
         self.tcp_conn_attempts: dict = {}
         self.shutting_down = False
         self.running = False
+        # Background firmware-release watcher, only created when capture is
+        # switched on. Cancelled in stop() so a reload does not leave it behind.
+        self._firmware_task: Optional[asyncio.Task] = None
         self._server = None
         self.start_task = None
         self.ssl_context: Optional[ssl.SSLContext] = None
@@ -187,6 +196,89 @@ class nCyncServer:
             f"{g.env.mqtt_topic}/status/bridge/tcp_devices/connected",
             str(len(devs)).encode(),
         )
+
+    def _start_firmware_watcher(self) -> None:
+        """Begin watching for firmware releases, if capture is switched on.
+
+        Off unless CYNC_FIRMWARE_CAPTURE_DIR is set, and a no-op otherwise -
+        this must not add background traffic to the vendor's API for people who
+        never asked for it.
+        """
+        if not CYNC_FIRMWARE_CAPTURE_DIR:
+            return
+        if getattr(self, "_firmware_task", None) is not None:
+            return
+        self._firmware_task = asyncio.create_task(self._watch_for_firmware())
+        logger.info(
+            f"{self.lp} firmware capture ENABLED -> {CYNC_FIRMWARE_CAPTURE_DIR} "
+            f"(checking every {CYNC_FIRMWARE_CHECK_INTERVAL}s). Images are "
+            "downloaded for inspection only and are NEVER installed."
+        )
+
+    async def _watch_for_firmware(self) -> None:
+        """Ask the cloud for firmware releases and save any it offers.
+
+        **Nothing here can install anything.** It calls exactly two cloud
+        methods - one that asks a question and one that writes a file - and
+        touches no device session and no OTA opcode. The devices are not
+        contacted at all; the only thing that happens on the network is an
+        HTTPS request to the vendor's own update endpoint and, if it answers
+        with a release, a download of the image it advertises.
+
+        Deliberately not tied to a device being connected. Whether an image
+        exists is a property of the account and the model, not of whether a
+        particular bulb happens to be online right now.
+        """
+        lp = f"{self.lp}firmware:"
+        # Let the server settle and devices identify themselves first - the
+        # device list is what tells us which models to ask about.
+        await asyncio.sleep(60)
+        while self.running and not self.shutting_down:
+            try:
+                await self._capture_available_firmware(lp)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.debug(f"{lp} check failed, will retry: {exc}")
+            await asyncio.sleep(CYNC_FIRMWARE_CHECK_INTERVAL)
+
+    async def _capture_available_firmware(self, lp: str) -> None:
+        """One pass: ask about each distinct model, save anything offered."""
+        api = getattr(g, "cync_cloud_api", None)
+        if api is None:
+            logger.debug(f"{lp} no cloud API available yet, skipping this pass")
+            return
+
+        # One query per (product, model, version) rather than per device: a
+        # release is published against a model, so asking once per bulb would
+        # multiply requests to the vendor by ~50 for identical answers.
+        seen: set[tuple] = set()
+        for device in list(self.node_devices.values()):
+            product_id = getattr(device, "product_id", None)
+            meta = getattr(device, "metadata", None)
+            ota_type = getattr(meta, "ota_type", None) if meta else None
+            version = getattr(device, "firmware_version", None)
+            if not product_id or ota_type is None or version is None:
+                continue
+            key = (product_id, device.type, str(version))
+            if key in seen:
+                continue
+            seen.add(key)
+
+            task = await api.check_firmware_update(
+                device_id=device.id,
+                product_id=product_id,
+                ota_type=ota_type,
+                identify=device.type,
+                current_version=int(version) if str(version).isdigit() else 0,
+            )
+            if not task or task.get("up_to_date"):
+                continue
+            logger.info(
+                f"{lp} cloud offers {task.get('target_version')} for product "
+                f"{product_id} (currently {task.get('from_version')}) - capturing"
+            )
+            await api.capture_firmware(task)
 
     @staticmethod
     def _ensure_self_signed_cert(cert_path: str, key_path: str) -> None:
@@ -297,6 +389,7 @@ class nCyncServer:
                 f" see any, check your DNS redirection, VLAN and firewall settings."
             )
             self.running = True
+            self._start_firmware_watcher()
             try:
                 if g.mqtt_client:
                     await g.mqtt_client.publish(
@@ -318,6 +411,9 @@ class nCyncServer:
         try:
             self.shutting_down = True
             lp = f"{self.lp}stop:"
+            if self._firmware_task is not None:
+                self._firmware_task.cancel()
+                self._firmware_task = None
             device: CyncTCPSession
             devices = list(self.tcp_connections.values())
             if devices:

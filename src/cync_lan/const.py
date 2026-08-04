@@ -141,6 +141,28 @@ CYNC_SECRET_KEY: str = os.environ.get("CYNC_SECRET_KEY", None)
 CYNC_RAW = os.environ.get("CYNC_RAW_DEBUG", "0").casefold() in YES_ANSWER
 CYNC_DEBUG = os.environ.get("CYNC_DEBUG", "0").casefold() in YES_ANSWER
 
+# Firmware capture. Off unless a directory is set.
+#
+# When enabled, the server periodically asks the cloud whether an update exists
+# for each known device and, if one does, downloads the image to this directory
+# for inspection. It **never installs anything**: nothing in the capture path
+# touches an OTA opcode, opens a device session, or writes to a device. The
+# only device-facing traffic it can cause is the ordinary status polling the
+# server already does.
+#
+# The point is to be able to look at what the vendor would have flashed -
+# whether images are signed or encrypted, what bootloader they carry, whether
+# a LibreTiny/OpenBeken path is even conceivable - without putting an untested
+# image on hardware you rely on. See docs/hardware_and_protocol_specifications.md.
+CYNC_FIRMWARE_CAPTURE_DIR: Optional[str] = (
+    os.environ.get("CYNC_FIRMWARE_CAPTURE_DIR") or None
+)
+# How often to ask, in seconds. Firmware releases are rare and the endpoint is
+# the vendor's, so this is deliberately slow - six hours by default.
+CYNC_FIRMWARE_CHECK_INTERVAL: int = int(
+    os.environ.get("CYNC_FIRMWARE_CHECK_INTERVAL", 21600)
+)
+
 CYNC_BASE_DIR: str = os.environ.get("CYNC_BASE_DIR", "/root/cync-lan")
 CYNC_CFGAPPEND_DIR: str = os.environ.get("CYNC_CFGAPPEND_DIR", "/config")
 CYNC_OVERWRITE_CONFIG_FILE: bool = (

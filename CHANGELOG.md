@@ -7,6 +7,38 @@ Assistant `cync_lan` custom_component's own version scheme - all three are
 versioned and released separately. See the root `README.md`/`RELEASING.md`
 on `feature/ha-custom-component` for how the three artifacts relate.
 
+### 0.8.0
+
+**New: firmware capture.** Set `CYNC_FIRMWARE_CAPTURE_DIR` and the server
+periodically asks the cloud whether a release exists for each model on the
+account, downloads any image it is offered, and writes it there as a `.bin`
+with a sidecar `.json` recording the URL, versions, size and MD5.
+
+**It never installs anything.** Nothing in the capture path touches an OTA
+opcode, opens a device session, or takes a device argument — `capture_firmware`
+accepts an upgrade task and a destination directory and that is the whole
+surface. A test asserts that structurally, on the signature and the function
+body, rather than trusting that today's implementation happens not to; a
+mutation adding a send call fails it.
+
+Endpoint and payload are the app's own: `Cloud$Firmware.a()` builds
+`/upgrade/firmware/check/{id}/geapp?useHttps=true`, and
+`FirmwareUpgradeTaskResponse` declares the reply — including
+`target_version_url`, `target_version_md5` and `target_version_size`, i.e. the
+vendor publishes a direct download link. `scripts/cync_ota_fetch.py` already
+reached the point of confirming that URL resolves with a HEAD request; this
+completes it by fetching and verifying the image.
+
+Off unless the directory is set — it must not add background traffic to the
+vendor's API for people who never asked for it. Default interval six hours,
+`CYNC_FIRMWARE_CHECK_INTERVAL`. One query per distinct model rather than per
+device, since a release is published against a model and asking per bulb would
+multiply identical requests by the size of the account.
+
+An image that fails MD5 or size verification is **kept**, with the mismatch
+recorded. A truncated or re-signed image is itself a finding and deleting it
+would destroy the evidence.
+
 ### 0.7.0
 
 **Fixed: the `0xDC` status slot was being parsed wrongly, and on `main` it was

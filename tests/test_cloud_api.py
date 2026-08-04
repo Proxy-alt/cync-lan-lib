@@ -11,6 +11,9 @@ logic is based on.
 from __future__ import annotations
 
 import datetime
+import hashlib
+import json
+from unittest.mock import MagicMock
 
 from cync_lan.cloud_api import (
     CyncCloudAPI,
@@ -433,3 +436,96 @@ async def test_full_login_response_is_unaffected(monkeypatch):
     assert await api._send_tkn_post("https://example.invalid/token", {}) is True
     assert written["token"].user_id == 99999
     assert written["token"].authorize == "fresh-authorize"
+
+
+# --------------------------------------------------------------------------
+# Firmware capture. Downloads for inspection; must never install.
+# --------------------------------------------------------------------------
+
+
+def _fw_task(**over):
+    task = {
+        "target_version_url": "https://example.invalid/fw.bin",
+        "target_version": "1234",
+        "from_version": "1000",
+        "product_id": "abc123",
+        "target_version_md5": hashlib.md5(b"FIRMWARE").hexdigest(),
+        "target_version_size": len(b"FIRMWARE"),
+    }
+    task.update(over)
+    return task
+
+
+class _FakeGet:
+    def __init__(self, payload: bytes, status: int = 200):
+        self._payload, self.status = payload, status
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def read(self):
+        return self._payload
+
+
+async def test_capture_firmware_writes_the_image_and_a_sidecar(tmp_path):
+    api = CyncCloudAPI()
+    api.http_session = MagicMock()
+    api.http_session.get = lambda *a, **k: _FakeGet(b"FIRMWARE")
+
+    path = await api.capture_firmware(_fw_task(), dest_dir=str(tmp_path))
+
+    assert path is not None and path.suffix == ".bin"
+    assert path.read_bytes() == b"FIRMWARE"
+    meta = json.loads((tmp_path / f"{path.stem}.json").read_text())
+    assert meta["md5_matches"] is True
+    assert meta["size_matches"] is True
+    assert meta["bytes_written"] == 8
+
+
+async def test_capture_firmware_keeps_an_image_that_fails_verification(tmp_path):
+    """A truncated or re-signed image is itself the finding. Deleting it would
+    destroy the evidence that something is off."""
+    api = CyncCloudAPI()
+    api.http_session = MagicMock()
+    api.http_session.get = lambda *a, **k: _FakeGet(b"TRUNCATED")
+
+    path = await api.capture_firmware(_fw_task(), dest_dir=str(tmp_path))
+
+    assert path is not None and path.exists()
+    meta = json.loads((tmp_path / f"{path.stem}.json").read_text())
+    assert meta["md5_matches"] is False
+
+
+async def test_capture_firmware_does_not_refetch_what_it_already_has(tmp_path):
+    api = CyncCloudAPI()
+    calls = []
+
+    def _get(*a, **k):
+        calls.append(a)
+        return _FakeGet(b"FIRMWARE")
+
+    api.http_session = MagicMock()
+    api.http_session.get = _get
+
+    await api.capture_firmware(_fw_task(), dest_dir=str(tmp_path))
+    await api.capture_firmware(_fw_task(), dest_dir=str(tmp_path))
+    assert len(calls) == 1
+
+
+async def test_capture_firmware_has_no_way_to_reach_a_device():
+    """Structural, not behavioural. The value of this feature depends on it
+    being incapable of flashing, so assert on the signature and body rather
+    than trusting that today's implementation happens not to."""
+    import inspect
+
+    src = inspect.getsource(CyncCloudAPI.capture_firmware)
+    sig = inspect.signature(CyncCloudAPI.capture_firmware)
+
+    assert set(sig.parameters) == {"self", "task", "dest_dir"}, (
+        "capture must not take a device, session or opcode argument"
+    )
+    for forbidden in ("send(", "write(", "0x4F", "StartHubFirmware", "ota_start"):
+        assert forbidden not in src, f"capture path references {forbidden!r}"

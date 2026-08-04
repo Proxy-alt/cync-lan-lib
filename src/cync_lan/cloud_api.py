@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import datetime
+import hashlib
 import json
 import logging
 import os
@@ -27,6 +28,7 @@ from cync_lan.const import (
     CYNC_CONFIG_FILE_PATH,
     CYNC_CORP_ID,
     CYNC_EXPORT_SOURCE,
+    CYNC_FIRMWARE_CAPTURE_DIR,
     CYNC_LOG_NAME,
     CYNC_OVERWRITE_CONFIG_FILE,
     CYNC_SECRET_KEY,
@@ -485,6 +487,138 @@ class CyncCloudAPI:
             if logit is True:
                 logger.warning(f"{lp} Cync Cloud API Error: {error_data}")
         return ret
+
+    async def check_firmware_update(
+        self,
+        device_id: int,
+        product_id: str,
+        ota_type: int,
+        identify: int,
+        current_version: int,
+    ) -> Optional[dict]:
+        """Ask the cloud whether a firmware update exists for one device.
+
+        Endpoint and payload confirmed from the app: `Cloud$Firmware.a()` builds
+        `{base}/upgrade/firmware/check/{id}/geapp?useHttps=true`, and
+        `FirmwareUpgradeTaskResponse` declares the reply fields - notably
+        `target_version_url`, `target_version_md5` and `target_version_size`,
+        i.e. the vendor hands out a direct, plain download link.
+
+        Returns the parsed upgrade task, or `{"up_to_date": True, ...}` when the
+        cloud says there is nothing to install (HTTP 404 with code 4041013),
+        or None on any other failure.
+
+        **This asks a question and nothing more.** It sends no device traffic.
+        """
+        lp = f"{self.lp}:firmware check:"
+        url = f"{CYNC_API_BASE}upgrade/firmware/check/{device_id}/geapp?useHttps=true"
+        payload = {
+            "type": ota_type,
+            "identify": identify,
+            "product_id": product_id,
+            "current_version": current_version,
+        }
+        headers = {"Content-Type": "application/json"}
+        if self.token_cache is not None:
+            headers["Access-Token"] = self.token_cache.access_token
+        try:
+            async with self.http_session.post(
+                url,
+                json=payload,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=self.api_timeout),
+            ) as resp:
+                body = await resp.json(content_type=None)
+                if resp.status == 200:
+                    return body
+                # The cloud's way of saying "already current".
+                code = (body or {}).get("error", {}).get("code")
+                if code == 4041013:
+                    return {"up_to_date": True, "code": code}
+                logger.debug(f"{lp} HTTP {resp.status} for device {device_id}: {body}")
+                return None
+        except Exception as exc:
+            logger.debug(f"{lp} device {device_id}: {exc}")
+            return None
+
+    async def capture_firmware(
+        self, task: dict, dest_dir: Optional[str] = None
+    ) -> Optional[Path]:
+        """Download a firmware image to disk for inspection. Never installs it.
+
+        Deliberately has no path to a device. It takes an upgrade task, fetches
+        the URL the cloud published, writes it to a file and verifies it - there
+        is no session, no opcode and no device argument anywhere in this
+        function, so it cannot flash something by accident or by a later edit
+        that "adds the install step while we're here".
+
+        Verifies against the cloud's own `target_version_md5` and
+        `target_version_size` and records the outcome in a sidecar `.json`. A
+        mismatch is written down rather than raised: a truncated or re-signed
+        image is itself a finding, and deleting the evidence would be the wrong
+        response to it.
+
+        Returns the path written, or None if there was nothing to fetch.
+        """
+        lp = f"{self.lp}:firmware capture:"
+        url = task.get("target_version_url")
+        if not url:
+            return None
+        directory = Path(dest_dir or CYNC_FIRMWARE_CAPTURE_DIR or ".")
+        directory.mkdir(parents=True, exist_ok=True)
+
+        version = str(task.get("target_version", "unknown"))
+        product = str(task.get("product_id", "unknown"))
+        stem = f"cync_fw_{product}_{version}".replace("/", "_")
+        target = directory / f"{stem}.bin"
+        if target.exists():
+            logger.debug(f"{lp} already have {target.name}, skipping")
+            return target
+
+        try:
+            async with self.http_session.get(
+                url, timeout=aiohttp.ClientTimeout(total=300)
+            ) as resp:
+                if resp.status != 200:
+                    logger.warning(f"{lp} HTTP {resp.status} fetching {url}")
+                    return None
+                blob = await resp.read()
+        except Exception as exc:
+            logger.warning(f"{lp} could not fetch {url}: {exc}")
+            return None
+
+        digest = hashlib.md5(blob).hexdigest()  # noqa: S324 - matching the vendor
+        expected_md5 = (task.get("target_version_md5") or "").lower()
+        expected_size = task.get("target_version_size")
+        meta = {
+            "url": url,
+            "product_id": product,
+            "target_version": version,
+            "from_version": task.get("from_version"),
+            "bytes_written": len(blob),
+            "md5": digest,
+            "expected_md5": expected_md5 or None,
+            "expected_size": expected_size,
+            "md5_matches": (digest == expected_md5) if expected_md5 else None,
+            "size_matches": (
+                len(blob) == expected_size if expected_size is not None else None
+            ),
+        }
+        target.write_bytes(blob)
+        (directory / f"{stem}.json").write_text(json.dumps(meta, indent=2))
+
+        if meta["md5_matches"] is False or meta["size_matches"] is False:
+            logger.warning(
+                f"{lp} {target.name} does not match what the cloud advertised "
+                f"(md5 {digest} vs {expected_md5}, {len(blob)} vs {expected_size} "
+                "bytes). Kept anyway - the mismatch is itself worth looking at."
+            )
+        else:
+            logger.info(
+                f"{lp} captured {target.name} ({len(blob)} bytes) for inspection. "
+                "Not installed - nothing was sent to any device."
+            )
+        return target
 
     async def export_config_file(self) -> bool:
         """Get Cync devices from the cloud"""
