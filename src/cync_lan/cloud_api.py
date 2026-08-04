@@ -121,6 +121,13 @@ class CyncCloudAPI:
     # via the session= kwarg (see __init__) - close() must not close a
     # session it doesn't own.
     _session_injected: bool = False
+    # The most recent firmware image captured, as the sidecar metadata dict
+    # plus `path` and `captured_at`. None until one lands - which may be
+    # months, since it depends on the vendor publishing a release. Read by the
+    # Home Assistant integration's "Last Firmware Released" sensor; kept here
+    # rather than only on disk so a consumer does not have to scrape a
+    # directory to notice something arrived.
+    last_firmware_capture: Optional[dict] = None
     _instance: "CyncCloudAPI" = None
 
     def __new__(cls, *args, **kwargs):
@@ -572,7 +579,24 @@ class CyncCloudAPI:
         stem = f"cync_fw_{product}_{version}".replace("/", "_")
         target = directory / f"{stem}.bin"
         if target.exists():
-            logger.debug(f"{lp} already have {target.name}, skipping")
+            # Already captured. Re-publish it as the last known capture anyway:
+            # the device never actually updates (nothing here installs), so the
+            # cloud keeps offering the same release forever, and this is what
+            # repopulates the sensor after a restart without re-downloading.
+            logger.debug(f"{lp} already have {target.name}, skipping download")
+            sidecar = directory / f"{stem}.json"
+            try:
+                known = json.loads(sidecar.read_text()) if sidecar.exists() else {}
+            except Exception:
+                known = {}
+            if self.last_firmware_capture is None:
+                self.last_firmware_capture = {
+                    **known,
+                    "path": str(target),
+                    "captured_at": datetime.datetime.fromtimestamp(
+                        target.stat().st_mtime, datetime.timezone.utc
+                    ).isoformat(),
+                }
             return target
 
         try:
@@ -606,6 +630,11 @@ class CyncCloudAPI:
         }
         target.write_bytes(blob)
         (directory / f"{stem}.json").write_text(json.dumps(meta, indent=2))
+        self.last_firmware_capture = {
+            **meta,
+            "path": str(target),
+            "captured_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        }
 
         if meta["md5_matches"] is False or meta["size_matches"] is False:
             logger.warning(

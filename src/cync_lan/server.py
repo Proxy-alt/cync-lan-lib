@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import datetime
 import logging
 import ssl
@@ -204,13 +205,19 @@ class nCyncServer:
         this must not add background traffic to the vendor's API for people who
         never asked for it.
         """
-        if not CYNC_FIRMWARE_CAPTURE_DIR:
+        # Re-read rather than trusting the import-time constant: consumers
+        # set this from their own config after cync_lan.const was already
+        # imported, so the cached value is stale on first setup.
+        capture_dir = os.environ.get("CYNC_FIRMWARE_CAPTURE_DIR") or (
+            CYNC_FIRMWARE_CAPTURE_DIR
+        )
+        if not capture_dir:
             return
         if getattr(self, "_firmware_task", None) is not None:
             return
         self._firmware_task = asyncio.create_task(self._watch_for_firmware())
         logger.info(
-            f"{self.lp} firmware capture ENABLED -> {CYNC_FIRMWARE_CAPTURE_DIR} "
+            f"{self.lp} firmware capture ENABLED -> {capture_dir} "
             f"(checking every {CYNC_FIRMWARE_CHECK_INTERVAL}s). Images are "
             "downloaded for inspection only and are NEVER installed."
         )
