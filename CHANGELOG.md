@@ -7,6 +7,71 @@ Assistant `cync_lan` custom_component's own version scheme - all three are
 versioned and released separately. See the root `README.md`/`RELEASING.md`
 on `feature/ha-custom-component` for how the three artifacts relate.
 
+### 0.7.0
+
+**Fixed: the `0xDC` status slot was being parsed wrongly, and on `main` it was
+inverted.** The field meanings are now taken from the shipping app's own parser
+(`MeshStatusNotification$TelinkParser` → `product/MeshState.java`) rather than
+inferred from captures:
+
+```
+slot[0]  address    a slot holds a device only when this is > 0
+slot[1]  online     the flag behind MeshStateWithOnlineInfo
+slot[2]  bits 0-6 brightness (coerced 0..100), bit 7 full-colour
+slot[3]  run mode / packed RGB; 0xFF and 0x7F are sentinels
+```
+
+`slot[1]` is not, and never was, a presence byte. acync skips a slot whose
+second byte is zero; a previous revision here inverted that on the strength of
+one capture and skipped every slot whose second byte was *non*-zero. On a
+46-node mesh that keeps 6 slots and drops 38 — every reachable device. This
+never reached a release, but it was on `main` and would have shipped into
+`cync-ble`.
+
+Two independent confirmations, without the decompile. Device 21 decodes to
+`[21, 183, 100, 0]` while the TCP transport — a wholly separate protocol —
+reports `pow=1 bri=100` for it at the same moment; the inverted rule skips it.
+And the "unexplained record shape" that made up 25 of 34 captured slots is
+simply reachable devices that are switched off: devices 22 and 26 decode to
+brightness 0, with TCP concurrently reporting `pow=0 bri=0` for both.
+
+Alongside that:
+
+- **`DeviceStatus.online` is new.** An unreachable device still reports the
+  last level the mesh knew, which is real information but not a fresh reading.
+- **`colour_temp` is no longer reported as 255.** `0xFF` is a sentinel the app
+  routes away from its colour decode, and a CCT device cannot be at 255, so
+  surfacing it invented a reading.
+- Power derived as `brightness != 0` is now **confirmed against the vendor
+  implementation**, not only against observed behaviour.
+
+**New: `BleMeshSession.set_wifi_credentials()`** — the Wi-Fi credential handoff
+(`SetWifiCommand`), the last unbuilt piece of BLE provisioning and the one part
+of this protocol with no prior art anywhere. The payload
+(`[chunks][len(ssid)][ssid][len(pass)][pass][0x01][type]`) is cut into 8-byte
+pieces, each sent as its own fully-encrypted mesh command — no cleartext
+credentials go on air. The chunk index occupies packet byte 2, which every
+ordinary command leaves zero; that is load-bearing rather than cosmetic,
+because byte 2 feeds both the authentication nonce and the keystream IV.
+`build_command`/`BleMeshSession.send` grew a keyword-only `chunk_index` for it.
+
+**Not verified against hardware** — that needs a factory-fresh unit. This
+transport has no acknowledgement, so a silent success here proves nothing.
+
+**Fixed: the mesh address is 16-bit, and only the low byte was being read.**
+`MeshAddress` is `base_address | (element_id << 8)`, little-endian (confirmed
+against `DataBytes.m15001d`). Reading one byte is correct for every device seen
+so far because they all carry element 0 — by luck, not construction. A
+multi-gang device using the high byte would have had every gang collapse onto
+the parent id silently. Per-element addressing is still not implemented (it
+needs hardware that uses it); what changed is that the case now logs the full
+address and asks for the device model instead of being invisible.
+
+Also recorded, in `set_light_effect`'s docstring: the second Reveal code path
+(`SetComboCommand`, `0xF0`, with a two-byte `[0xFF, 0xF0]` sentinel) is
+deliberately not wired in. It refuses `RevealColor` for hub-relayed devices, so
+it is the strictly less capable of two routes to an identical result.
+
 ### 0.6.0
 
 **New: a BLE mesh transport, confirmed on real hardware.** `cync_lan.ble_mesh`
