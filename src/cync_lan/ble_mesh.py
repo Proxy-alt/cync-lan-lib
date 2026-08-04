@@ -158,6 +158,22 @@ OP_STATUS_NOTIFY = 0xDC
 OP_SET_BRIGHTNESS = OP_SET_BRIGHTNESS_SOL
 OP_SET_TEMP_RGB = OP_SET_TEMP_SOL
 
+# Hands a Wi-Fi-capable device its network credentials, over the same
+# encrypted mesh-command path as everything else - no cleartext ever goes on
+# air. `SetWifiCommand.java`'s opcode array is {0xF6, 0x11, 0x02, 0x02}: the
+# opcode, the vendor id, and a sub-discriminator that rides in the payload.
+OP_SET_WIFI = 0xF6
+_WIFI_SUBCODE = 0x02
+_WIFI_CHUNK_LEN = 8
+
+# `TelinkBleDeviceController.m14192x` resolves a null target to
+# `MeshAddress.c(deviceId.index)`, and a freshly discovered device's index is
+# 0 - the SELF_ADDRESS sentinel (`MeshAddress.java:110`). Numerically the same
+# as the broadcast address build_command warns about, and safe here for the
+# reason that warning does not cover: an unprovisioned device is the only one
+# on the link, so "everyone" and "you" are the same set.
+SELF_ADDRESS = 0
+
 _PAIRING_OPCODE = 0x0C
 _PACKET_LEN = 20
 _MAX_COUNTER = 0xFFFF
@@ -289,13 +305,27 @@ def decrypt_packet(session_key: bytes, address: bytes, packet: bytearray) -> byt
     return packet
 
 
-def build_command(counter: int, target: int, opcode: int, data: bytes) -> bytearray:
+def build_command(
+    counter: int,
+    target: int,
+    opcode: int,
+    data: bytes,
+    *,
+    chunk_index: int = 0,
+) -> bytearray:
     """Lay out one plaintext mesh command.
 
     `target` is a mesh device id - `int(str(deviceID)[-3:])`, as
     `cloud_api._parse_raw_export` computes it. **0 is the broadcast address**
     and commands every device on the mesh at once; callers wanting one device
     must not pass it by accident.
+
+    `chunk_index` fills byte 2, which is zero for every ordinary command.
+    `SetWifiCommand` is the one that uses it, to number the pieces of a
+    credential payload too long for a single packet. It is not merely
+    cosmetic: byte 2 is part of both the authentication nonce and the
+    keystream IV (see `encrypt_packet`), so each chunk encrypts under a
+    different keystream and the field has to be set before encryption.
     """
     if len(data) > _PACKET_LEN - 10:
         raise BleMeshError(f"payload too long for one packet: {len(data)} bytes")
@@ -303,6 +333,7 @@ def build_command(counter: int, target: int, opcode: int, data: bytes) -> bytear
     packet = bytearray(_PACKET_LEN)
     packet[0] = counter & 0xFF
     packet[1] = (counter >> 8) & 0xFF
+    packet[2] = chunk_index & 0xFF
     packet[5] = target & 0xFF
     packet[6] = (target >> 8) & 0xFF
     packet[7] = opcode
@@ -312,6 +343,60 @@ def build_command(counter: int, target: int, opcode: int, data: bytes) -> bytear
     packet[9] = (VENDOR_ID >> 8) & 0xFF
     packet[10 : 10 + len(data)] = data
     return packet
+
+
+def build_wifi_payload(ssid: str, password: str, device_type: int) -> bytes:
+    """The plaintext credential buffer, before it is cut into packets.
+
+    Layout from `Utilities.java:225-236`:
+
+        [total chunks (1B)]
+        [len(ssid) (1B)][ssid, UTF-8]
+        [len(password) (1B)][password, UTF-8]
+        [0x01]
+        [device type id (1B)]
+
+    The length the chunk count is computed from includes the count byte
+    itself, which is why the app's formula is
+    `ceil((len(ssid) + len(password) + 5) / 8)`.
+    """
+    ssid_bytes = ssid.encode("utf-8")
+    password_bytes = password.encode("utf-8")
+    if not 0 < len(ssid_bytes) < 256:
+        raise BleMeshError(f"ssid must be 1-255 UTF-8 bytes, got {len(ssid_bytes)}")
+    if len(password_bytes) > 255:
+        raise BleMeshError(
+            f"password must be at most 255 UTF-8 bytes, got {len(password_bytes)}"
+        )
+    if not 0 <= device_type <= 0xFF:
+        raise BleMeshError(f"device type must fit one byte, got {device_type}")
+
+    total = len(ssid_bytes) + len(password_bytes) + 5
+    chunks = -(-total // _WIFI_CHUNK_LEN)
+    if chunks > 0xFF:
+        raise BleMeshError("credentials are too long to chunk")
+    return (
+        bytes([chunks, len(ssid_bytes)])
+        + ssid_bytes
+        + bytes([len(password_bytes)])
+        + password_bytes
+        + bytes([0x01, device_type])
+    )
+
+
+def build_wifi_chunks(payload: bytes) -> list[bytes]:
+    """Cut a credential buffer into the per-packet pieces, 1-based.
+
+    Each returned item is the command payload for one packet: the WiFi
+    sub-discriminator, the chunk index repeated (the app writes it both in
+    byte 2 of the packet and again here), then up to eight payload bytes.
+    """
+    out: list[bytes] = []
+    for index, start in enumerate(range(0, len(payload), _WIFI_CHUNK_LEN), start=1):
+        out.append(
+            bytes([_WIFI_SUBCODE, index]) + payload[start : start + _WIFI_CHUNK_LEN]
+        )
+    return out
 
 
 def parse_status(plaintext: bytes) -> list[DeviceStatus]:
@@ -582,7 +667,9 @@ class BleMeshSession:
         self._notify_active = True
         return True
 
-    async def send(self, target: int, opcode: int, data: bytes) -> None:
+    async def send(
+        self, target: int, opcode: int, data: bytes, *, chunk_index: int = 0
+    ) -> None:
         """Encrypt and write one command.
 
         Fire and forget - the control characteristic is written without a
@@ -595,12 +682,54 @@ class BleMeshSession:
         if not self._client.is_connected:
             raise BleMeshError("link is down")
 
-        packet = build_command(self._counter, target, opcode, data)
+        packet = build_command(
+            self._counter, target, opcode, data, chunk_index=chunk_index
+        )
         self._counter = 1 if self._counter >= _MAX_COUNTER else self._counter + 1
         encrypted = encrypt_packet(self._session_key, self._address, packet)
         await self._client.write_gatt_char(
             CONTROL_CHAR, bytes(encrypted), response=False
         )
+
+    async def set_wifi_credentials(
+        self,
+        ssid: str,
+        password: str,
+        device_type: int,
+        *,
+        target: int = SELF_ADDRESS,
+    ) -> int:
+        """Hand a Wi-Fi-capable device its network credentials.
+
+        The last step of commissioning, and the one piece of this protocol
+        with no prior art anywhere - it is Cync/GE-specific, layered on the
+        generic Telink base. Everything about the transport is ordinary
+        though: N fully-encrypted mesh commands sent in sequence, not one long
+        GATT write and not a special unencrypted framing. **No cleartext
+        credentials go on air.**
+
+        Returns the number of chunks written.
+
+        **Not verified against hardware.** Every field is read from
+        `SetWifiCommand.java` and `Utilities.m13402k` and cross-checked
+        against `TelinkDeviceBleManager.java:1361-1375`, and the encryption is
+        the same routine every confirmed command already uses - but no device
+        has actually been provisioned with it here, because doing so needs a
+        factory-fresh unit. Treat a silent success as unproven: this transport
+        has no acknowledgement, so a wrong payload looks exactly like a right
+        one from this side.
+        """
+        payload = build_wifi_payload(ssid, password, device_type)
+        chunks = build_wifi_chunks(payload)
+        for index, chunk in enumerate(chunks, start=1):
+            await self.send(target, OP_SET_WIFI, chunk, chunk_index=index)
+        logger.debug(
+            "%s: wrote Wi-Fi credentials for SSID %r as %d chunk(s)",
+            self._mac,
+            ssid,
+            len(chunks),
+        )
+        return len(chunks)
 
     async def set_power(self, target: int, on: bool) -> None:
         """Confirmed working on hardware."""

@@ -4,7 +4,10 @@ pairing/session-key handshake, and the mesh-credential handoff that gives
 a device its permanent mesh name/password/LTK. See
 docs/ble_provisioning_protocol.md for the full protocol research this
 implements (service/characteristic UUIDs, the encryption algorithm, the
-WiFi-credential handoff format for WiFi-capable devices).
+WiFi-credential handoff format for WiFi-capable devices - that last one
+is implemented in ble_mesh.BleMeshSession.set_wifi_credentials, since it
+rides the ordinary encrypted command path rather than this module's
+pairing characteristic).
 
 UNTESTED AGAINST REAL HARDWARE as of this writing. Every byte here is
 confirmed from decompiled Cync Android app source, and the pairing/
@@ -386,9 +389,16 @@ async def provision_device(
        accepted the new credentials.
 
     Raises PairingError if the device doesn't respond as expected at any
-    step. Does NOT hand the device WiFi credentials (a separate step, see
-    docs/ble_provisioning_protocol.md's "WiFi credential handoff" section -
-    only relevant for WiFi-capable device types, not implemented here yet).
+    step.
+
+    Does not hand the device WiFi credentials, which is deliberately a
+    separate step: it only applies to WiFi-capable device types, and it needs
+    the SSID and passphrase, which this function has no business holding. The
+    command itself is implemented - see
+    `ble_mesh.BleMeshSession.set_wifi_credentials`, which speaks
+    `SetWifiCommand` over the same encrypted mesh path this function
+    establishes. Authenticate a session against the freshly provisioned
+    device and call it there.
 
     Requires the `bleak` optional dependency (`pip install cync_lan[ble]`).
     """

@@ -14,6 +14,8 @@ oracle along with it.
 
 from __future__ import annotations
 
+from unittest.mock import MagicMock
+
 import pytest
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
@@ -564,3 +566,70 @@ async def test_colour_temp_and_rgb_match_devices_py_payloads():
             build_command(1, 37, OP_SET_LEVEL, bytes([0x01, 0xFF, 0xFE, 10, 20, 30])),
         )
     )
+
+
+# --------------------------------------------------------------------------
+# WiFi credential handoff (SetWifiCommand).
+# --------------------------------------------------------------------------
+
+
+def test_wifi_payload_layout():
+    from cync_lan.ble_mesh import build_wifi_payload
+
+    payload = build_wifi_payload("net", "pw", device_type=31)
+    # 1 count + 1 len + 3 ssid + 1 len + 2 pass + 0x01 + type = 10 bytes,
+    # and the count is ceil((3 + 2 + 5) / 8) = 2.
+    assert payload == bytes([2, 3]) + b"net" + bytes([2]) + b"pw" + bytes([0x01, 31])
+    assert payload[0] == 2
+
+
+def test_wifi_payload_chunk_count_covers_the_count_byte_itself():
+    """The app's formula is ceil((len(ssid) + len(pass) + 5) / 8), and the 5
+    includes the count byte - so a buffer that is exactly 16 bytes long must
+    report 2, not 3."""
+    from cync_lan.ble_mesh import build_wifi_payload
+
+    payload = build_wifi_payload("a" * 6, "b" * 5, device_type=1)
+    assert len(payload) == 16
+    assert payload[0] == 2
+
+
+def test_wifi_chunks_are_numbered_from_one():
+    from cync_lan.ble_mesh import build_wifi_chunks
+
+    chunks = build_wifi_chunks(bytes(range(20)))
+    assert [c[1] for c in chunks] == [1, 2, 3]
+    assert all(c[0] == 0x02 for c in chunks), "sub-discriminator on every chunk"
+    assert chunks[0][2:] == bytes(range(8))
+    assert chunks[2][2:] == bytes(range(16, 20)), "a short final chunk is not padded"
+
+
+async def test_set_wifi_credentials_numbers_the_packets_in_byte_two():
+    """Byte 2 is not decoration - it feeds both the auth nonce and the
+    keystream IV, so every chunk must encrypt under its own index."""
+    from cync_lan.ble_mesh import _PACKET_LEN
+
+    client = MagicMock()
+    client.is_connected = True
+    written: list[bytes] = []
+
+    async def _write(_char, data, response=False):
+        written.append(bytes(data))
+
+    client.write_gatt_char = _write
+
+    session = BleMeshSession(client, "AA:BB:CC:DD:EE:FF", "name", "pass")
+    session._session_key = bytes(range(16))
+
+    sent = await session.set_wifi_credentials("mynet", "mypassword", device_type=31)
+
+    assert sent == len(written) == 3
+    assert all(len(p) == _PACKET_LEN for p in written)
+    assert [p[2] for p in written] == [1, 2, 3], "1-based chunk index in byte 2"
+
+
+async def test_set_wifi_credentials_rejects_an_empty_ssid():
+    from cync_lan.ble_mesh import BleMeshError, build_wifi_payload
+
+    with pytest.raises(BleMeshError):
+        build_wifi_payload("", "pw", device_type=1)
