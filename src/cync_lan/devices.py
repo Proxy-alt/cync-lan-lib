@@ -2398,7 +2398,20 @@ class CyncDevice:
         """The general light-run-mode command: any preset across Static/
         LightShow/MusicShow/Reveal/MultiColor (LIGHT_RUN_MODE_EFFECTS,
         src/cync_lan/const.py) rather than just the LightShow-only presets
-        set_lightshow() supports."""
+        set_lightshow() supports.
+
+        **Reveal has a second, real code path that is deliberately not wired
+        in.** The app's colour-tab picker reaches the same effect through the
+        everyday `SetComboCommand` (op `0xF0`) with a two-byte colour-type
+        sentinel `[0xFF, 0xF0]`, where CCT and RGB use four
+        (`SetComboCommand.java:816-818`). It is not implemented here, and the
+        reason is not just redundancy: `SetComboCommand` explicitly refuses
+        `RevealColor` for hub-relayed devices ("RevealColor is not supported
+        by hubs"), so it is the strictly less capable of the two routes to an
+        identical end-user result. `set_light_effect("reveal")` - modeCode
+        `0x03`, the app's own dedicated Reveal button - has no such
+        restriction. Recorded here so the second path does not look like an
+        oversight to whoever finds it in the decompile next."""
         lp = f"{self.lp}set_light_effect:"
         effect = effect.casefold()
         if effect not in LIGHT_RUN_MODE_EFFECTS:
