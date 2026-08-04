@@ -204,6 +204,11 @@ class DeviceStatus:
     red: int = 0
     green: int = 0
     blue: int = 0
+    #: Whether the mesh could actually reach this device when it reported.
+    #: An offline device's brightness is the last thing the mesh knew, not a
+    #: fresh reading, so consumers should prefer their own last-known state
+    #: over overwriting it with a stale zero.
+    online: bool = True
 
 
 def mac_to_address(mac: str) -> bytes:
@@ -312,41 +317,52 @@ def build_command(counter: int, target: int, opcode: int, data: bytes) -> bytear
 def parse_status(plaintext: bytes) -> list[DeviceStatus]:
     """Decode the device reports carried in a decrypted `0xDC` notification.
 
-    Two four-byte slots per packet, laid out `[id, presence, brightness, extra]`.
+    Two four-byte slots per packet, laid out `[address, online, level, extra]`.
 
-    **The presence rule here is the opposite of acync's, on purpose.** acync
-    skips a slot whose second byte is zero, treating it as absent. On the
-    hardware this was captured from, that discards exactly the slots carrying
-    real state and keeps the empty ones: across 17 packets, all nine slots with
-    `byte[1] == 0` held plausible values (brightness 100, extra 255) while all
-    twenty-five with `byte[1] != 0` were `brightness=0, extra=0` with a
-    byte[1] that varied like noise.
+    **The field meanings are taken from the shipping app's own parser**, not
+    inferred: `MeshStatusNotification$TelinkParser` slices the payload from
+    offset 10 into two four-byte groups, and `MeshState.Companion` (decompiled
+    `product/MeshState.java`) decodes each one as:
 
-    So a zero second byte is treated as *data-bearing*. This was recorded as
-    "plausible, not confirmed" for a long time - one capture, contradicting an
-    implementation known to work elsewhere. **It is now confirmed on
-    hardware.** A device was driven to known levels over BLE and the mesh
-    harvested after each change:
+        address = slot[0]              parsed only when > 0
+        online  = slot[1] != 0         the flag behind MeshStateWithOnlineInfo
+        level   = slot[2]              bits 0-6 brightness, coerced to 0..100
+                                       bit 7 marks a full-colour device
+        extra   = slot[3]              run mode / packed RGB; 0xFF and 0x7F
+                                       are sentinels, not colour values
+
+    and derives power as `brightness != 0` - which is exactly the on/off test
+    consumers already use, now confirmed against the vendor implementation
+    rather than only against behaviour.
+
+    **Two earlier readings of `slot[1]` were both wrong, in opposite
+    directions.** acync skips a slot whose second byte is zero; a previous
+    revision here inverted that and skipped every slot whose second byte was
+    *non*-zero, on the strength of a single capture in which the `byte[1] == 0`
+    records happened to be the interesting ones. That inversion discards every
+    reachable device - on a 46-node mesh it keeps 6 slots and drops 38.
+
+    Neither rule is a presence test at all: `slot[1]` is the online flag and
+    `slot[0]` is what says whether the slot holds a device. A live sweep
+    settles it independently of the decompile - device 21 reported
+    `slot = [21, 183, 100, 0]` while the TCP transport, watching the same
+    device over a completely separate protocol, reported `pow=1 bri=100`.
+    Under the inverted rule that device is skipped outright.
+
+    The earlier hardware confirmation still stands and is unaffected:
 
         set brightness 60  -> decoded 60
         set brightness 25  -> decoded 25
         set power off      -> decoded 0
 
-    Exact agreement at two distinct levels, and a return to zero when switched
-    off, across a 38-device sweep. A wrong decode does not do that by
-    accident, so the rule stands and `brightness > 0` is a sound on/off test.
-
-    The `byte[1] != 0` records remain unexplained; they may be a different
-    record type sharing the `0xDC` opcode.
+    Exact agreement at two distinct levels and a return to zero when switched
+    off, across a 38-device sweep.
 
     One timing caveat for consumers: a harvest taken immediately after a
     command can still report the *previous* value - observed once, with the
     next harvest a few seconds later reporting correctly. State propagates
     through the mesh at its own pace; do not read one stale sample as a failed
     command.
-
-    Brightness above 127 flags an RGB device and carries the colour packed into
-    the next byte.
     """
     if len(plaintext) < 18 or plaintext[7] != OP_STATUS_NOTIFY:
         return []
@@ -354,31 +370,45 @@ def parse_status(plaintext: bytes) -> list[DeviceStatus]:
     out: list[DeviceStatus] = []
     for offset in (10, 14):
         slot = plaintext[offset : offset + 4]
-        # See the docstring: a zero second byte marks the data-bearing case on
-        # the captured hardware, inverting acync's rule. An all-zero slot is
-        # genuinely nothing.
-        if len(slot) < 4 or slot[1] != 0 or slot == b"\x00\x00\x00\x00":
+        # The address is what says whether the slot holds a device - the app
+        # parses a group only when slot[0] > 0. Address 0 is the broadcast
+        # sentinel and never a real reporter.
+        if len(slot) < 4 or slot[0] == 0:
             continue
-        brightness = slot[2]
-        if brightness >= 128:
-            packed = slot[3]
+        online = slot[1] != 0
+        level = slot[2]
+        # Bit 7 is the full-colour flag, bits 0-6 the level. Coerced because
+        # the app does: the wire can carry values above 100 and they are not
+        # meaningful as a percentage.
+        brightness = min(level & 0x7F, 100)
+        extra = slot[3]
+        if level & 0x80:
             out.append(
                 DeviceStatus(
                     device_id=slot[0],
-                    brightness=brightness - 128,
+                    brightness=brightness,
                     is_rgb=True,
-                    red=int(((packed & 0xE0) >> 5) * 255 / 7),
-                    green=int(((packed & 0x1C) >> 2) * 255 / 7),
-                    blue=int((packed & 0x03) * 255 / 3),
+                    red=int(((extra & 0xE0) >> 5) * 255 / 7),
+                    green=int(((extra & 0x1C) >> 2) * 255 / 7),
+                    blue=int((extra & 0x03) * 255 / 3),
+                    online=online,
                 )
             )
         else:
+            # 0xFF and 0x7F are the app's sentinels in this byte, not colour
+            # temperatures - it routes both away from its run-mode decode. A
+            # CCT device cannot be at temperature 255, so reporting one would
+            # be inventing a reading; report no colour information instead.
+            # (The app's fallback synthesises an RGB value from the sentinel;
+            # that is not reproduced here, because claiming a colour for a
+            # device that reported none is the same invention in another form.)
             out.append(
                 DeviceStatus(
                     device_id=slot[0],
                     brightness=brightness,
                     is_rgb=False,
-                    colour_temp=slot[3],
+                    colour_temp=0 if extra in (0xFF, 0x7F) else extra,
+                    online=online,
                 )
             )
     return out

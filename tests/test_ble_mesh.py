@@ -202,54 +202,81 @@ def test_mesh_credentials_error_names_the_missing_field():
 
 
 def test_parse_status_reads_both_slots():
-    """Presence byte is 0 for a data-bearing slot - see parse_status."""
     packet = bytearray(20)
     packet[7] = 0xDC
-    packet[10:14] = bytes([37, 0, 50, 200])
-    packet[14:18] = bytes([38, 0, 0, 100])
+    packet[10:14] = bytes([37, 1, 50, 60])
+    packet[14:18] = bytes([38, 1, 0, 100])
     statuses = parse_status(bytes(packet))
     assert statuses == [
-        DeviceStatus(device_id=37, brightness=50, is_rgb=False, colour_temp=200),
+        DeviceStatus(device_id=37, brightness=50, is_rgb=False, colour_temp=60),
         DeviceStatus(device_id=38, brightness=0, is_rgb=False, colour_temp=100),
     ]
 
 
 def test_parse_status_against_real_captured_packets():
-    """Real bytes off a real mesh, so the presence rule is pinned to evidence.
-
-    These are two of the seventeen packets captured over BLE. The nine slots
-    with a zero presence byte carried plausible state - brightness 100, extra
-    255 - while twenty-five with a non-zero one were entirely zero. acync's rule
-    would have discarded exactly the nine that mattered.
-    """
     captured = bytes.fromhex("628db70000e9acdc1102f4006400d60064000000")
     assert [(s.device_id, s.brightness) for s in parse_status(captured)] == [
         (244, 100),
         (214, 100),
     ]
 
-    captured = bytes.fromhex("9bbfcb0000c015dc11020b0000ff2c0000ff0000")
-    assert [(s.device_id, s.colour_temp) for s in parse_status(captured)] == [
-        (11, 255),
-        (44, 255),
+
+def test_parse_status_reports_the_online_flag():
+    """`slot[1]` is the online flag the app exposes as MeshStateWithOnlineInfo,
+    and it is independent of the level - both devices here are unreachable
+    while still carrying the last level the mesh knew."""
+    captured = bytes.fromhex("628db70000e9acdc1102f4006400d60064000000")
+    statuses = parse_status(captured)
+    assert [s.online for s in statuses] == [False, False]
+    assert [s.brightness for s in statuses] == [100, 100]
+
+
+def test_parse_status_reports_switched_off_devices_rather_than_dropping_them():
+    """This shape - a non-zero `slot[1]` with a zero level - was previously
+    called an "unexplained record" and discarded, which is what a rule keyed on
+    `slot[1]` does. It is 25 of 34 slots in the capture set, and it is simply
+    reachable devices that are switched off.
+
+    Confirmed against a second, wholly separate transport: the TCP path reports
+    both of these devices as `pow=0 bri=0` at the same time.
+    """
+    captured = bytes.fromhex("52075b000066d7dc110216f300001a5f00000000")
+    statuses = parse_status(captured)
+    assert [(s.device_id, s.brightness, s.online) for s in statuses] == [
+        (22, 0, True),
+        (26, 0, True),
     ]
 
 
-def test_parse_status_ignores_the_unexplained_record_shape():
-    """A non-zero presence byte with an all-zero body is the shape that made up
-    25 of 34 captured slots. Unexplained, and deliberately not reported as a
-    device sitting at brightness zero."""
-    captured = bytes.fromhex("52075b000066d7dc110216f300001a5f00000000")
-    assert parse_status(captured) == []
+def test_parse_status_does_not_report_a_colour_temperature_of_255():
+    """0xFF is the app's sentinel in the extra byte, not a temperature - a CCT
+    device cannot be at 255, so reporting one invents a reading."""
+    captured = bytes.fromhex("9bbfcb0000c015dc11020b0000ff2c0000ff0000")
+    statuses = parse_status(captured)
+    assert [s.device_id for s in statuses] == [11, 44]
+    assert [s.colour_temp for s in statuses] == [0, 0]
+    assert not any(s.is_rgb for s in statuses)
 
 
-def test_parse_status_skips_wholly_empty_slots():
-    """An all-zero slot is genuinely nothing, presence byte included."""
+def test_parse_status_skips_slots_with_no_address():
+    """The address is what marks a slot as holding a device. A slot whose other
+    bytes are non-zero but whose address is 0 must not be reported as a device
+    with id 0 - that id is the broadcast sentinel."""
     packet = bytearray(20)
     packet[7] = 0xDC
-    packet[10:14] = bytes([0, 0, 0, 0])
-    packet[14:18] = bytes([38, 0, 25, 100])
+    packet[10:14] = bytes([0, 200, 55, 30])
+    packet[14:18] = bytes([38, 1, 25, 100])
     assert [s.device_id for s in parse_status(bytes(packet))] == [38]
+
+
+def test_parse_status_coerces_an_out_of_range_level():
+    """The app coerces to 0..100; the wire can carry more and it is not
+    meaningful as a percentage."""
+    packet = bytearray(20)
+    packet[7] = 0xDC
+    packet[10:14] = bytes([37, 1, 120, 0])
+    (status,) = parse_status(bytes(packet))
+    assert status.brightness == 100
 
 
 def test_parse_status_decodes_rgb_when_brightness_flags_it():
