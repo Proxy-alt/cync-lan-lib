@@ -2421,15 +2421,22 @@ class CyncDevice:
         await self._send_light_run_mode(mode_code, index, nonce, sub_id)
 
     async def identify(self, on: bool = True, sub_id: Optional[int] = None) -> None:
-        """EXPERIMENTAL: make this device announce itself physically, so you
-        can tell which bulb or switch an entity actually is.
+        """Make this device announce itself physically, so you can tell which
+        bulb or switch an entity actually is.
+
+        **Confirmed on real hardware** - tested on an outlet, which makes this
+        the second confirmed member of the `0x8E` mesh-relay family after
+        `set_indicator_led` (a switch). Two different sub-codes on two device
+        classes through the same dispatch is evidence about the envelope rather
+        than about either command, which was the open question for the whole
+        family. See docs/hardware_verification.md.
 
         Confirmed via IdentifyDeviceCommand.java: opcode array
         `{0xF7,0x11,0x02,0x03}` plus a single byte - 1 to start, 2 to stop -
         dispatched through the same
         XlinkCommandDelegate.DefaultImpls.c()->h() path (real outer op_code
-        0x8E, no repeated op byte) as set_indicator_led, which is the one
-        command in this family confirmed working on real hardware.
+        0x8E, no repeated op byte) as set_indicator_led - the other
+        confirmed member of this family.
 
         The device keeps announcing until told to stop; call with on=False
         to end it.
