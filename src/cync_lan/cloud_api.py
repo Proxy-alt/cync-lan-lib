@@ -111,6 +111,11 @@ def _decode_sensor_schedules(raw_schedules) -> dict:
     return decoded
 
 
+# See the comment at its use site in send_otp. Named rather than inlined so
+# the number is findable from a bug report that only quotes error 4001007.
+PASSWORD_MAX_LENGTH = 16
+
+
 class CyncCloudAPI:
     api_timeout: int = 8
     lp: str = "CyncCloudAPI"
@@ -314,7 +319,24 @@ class CyncCloudAPI:
         auth_data = {
             "corp_id": CYNC_CORP_ID,
             "email": CYNC_ACCOUNT_USERNAME,
-            "password": CYNC_ACCOUNT_PASSWORD[:16],
+            # Cync's signup form caps passwords at 16 characters, so an
+            # account created with a longer one only ever had the first 16
+            # stored. Sending the whole thing compares against something the
+            # server never saved and returns 400 `{"error": {"msg":
+            # "password error", "code": 4001007}}` - a credential mismatch
+            # rather than a malformed request, which is why it reads as a
+            # wrong password and invites the user to retype it and fail
+            # again. Truncation reconstructs what the account actually has.
+            #
+            # Truncate only, never strip. A space is a legal password
+            # character, and an account whose stored password genuinely ends
+            # in one cannot be told apart from a stray keystroke - so nothing
+            # changes except the length. There is a test on this, because
+            # "tidy the input" is the obvious-looking change that breaks it.
+            #
+            # A login shim, not validation: if this package ever grows a
+            # registration path, the limit belongs at the input instead.
+            "password": CYNC_ACCOUNT_PASSWORD[:PASSWORD_MAX_LENGTH],
             "two_factor": otp_code,
             "resource": "".join(random.choices(string.ascii_lowercase, k=16)),
         }

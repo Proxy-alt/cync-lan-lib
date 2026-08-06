@@ -620,3 +620,19 @@ async def test_missing_credentials_are_reported_not_raised(monkeypatch):
     api = cloud_api.CyncCloudAPI()
     monkeypatch.setattr(api, "_check_session", AsyncMock(return_value=None))
     assert await api.send_otp("123456") is False
+
+
+async def test_a_password_is_truncated_but_never_trimmed(_credentials, monkeypatch):
+    """Truncating to 16 must not quietly become stripping. A space is a legal
+    password character, and an account whose stored password really ends in
+    one is indistinguishable from a stray keystroke - only one of those two
+    guesses can be right, and silently picking the other one locks the user
+    out with a "password error" they cannot act on."""
+    padded = "hunter2" + " " * 9  # exactly 16, the last nine of them spaces
+    monkeypatch.setattr(cloud_api, "CYNC_ACCOUNT_PASSWORD", padded)
+    _, sent = await _sent_otp("123456", monkeypatch)
+    assert sent["password"] == padded
+
+    monkeypatch.setattr(cloud_api, "CYNC_ACCOUNT_PASSWORD", "MyPasswordIsCool ")
+    _, sent = await _sent_otp("123456", monkeypatch)
+    assert sent["password"] == "MyPasswordIsCool", "only the 17th character goes"
