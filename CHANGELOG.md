@@ -7,6 +7,54 @@ Assistant `cync_lan` custom_component's own version scheme - all three are
 versioned and released separately. See the root `README.md`/`RELEASING.md`
 on `feature/ha-custom-component` for how the three artifacts relate.
 
+### 0.9.0
+
+**New: cloud passthrough (`CYNC_CLOUD_PASSTHROUGH`).** Every accepted session
+is relayed to the real Cync cloud from its first byte, while cync-lan goes on
+parsing the same traffic and controlling devices locally. Devices stay
+cloud-connected, so the vendor's app, schedules and firmware delivery keep
+working through a server that is also doing its own thing with everything it
+sees.
+
+**This is the existing MITM machinery made into a setting, not a second
+implementation.** The relay, the per-connection rotating logs and the local
+parse-while-relaying behaviour have all been in `CyncTCPSession` for a while,
+reachable only through a per-device switch entity that is disabled by default.
+What was missing was a way to say "do this for everything".
+
+One thing genuinely differs, and it is why `enable_passthrough()` exists rather
+than reusing `start_mitm()`. That method has to hang up on the device after
+enabling: it is flicked on mid-session, the device is already several packets
+into a handshake with *us*, and the cloud would receive a conversation starting
+from the middle. The option is consulted in `start_tasks()` while a freshly
+accepted session is being wired up — after construction, before the receive
+task exists, so before a single byte has been read. The handshake reaches the
+cloud intact and a forced reconnect would only produce a loop.
+
+Failure is not fatal. A cloud that cannot be reached logs and leaves the
+session in ordinary local-only mode; being unable to phone home is not a reason
+to stop controlling lights.
+
+**Be clear about what it does:** turning this on sends your device traffic —
+and, if the app connects through this server too, your app traffic — to the
+vendor. That is the point of it, and it is the opposite of what cync-lan is
+normally for. Off by default.
+
+Two smaller things came with it, both previously unreachable rather than
+newly broken:
+
+- `_setup_mitm_logger()` dereferenced `self.node` in four places. Its only
+  caller was reachable from a per-node entity, so a node always existed;
+  passthrough calls it before the device has identified itself, where
+  `identifier` was never assigned at all. Now falls back to the address.
+- `existing_init()` called `g.mqtt_client.add_mitm_button()` without checking
+  for a client. Reached only after someone pressed a switch before; now every
+  reconnect goes through it, including on the CLI, where there is no client.
+
+`CYNC_CLOUD_PORT` joins `CYNC_CLOUD_IP` — the port was hardcoded at the one
+call site. Both are re-read where they are used, so a bad port degrades to the
+default instead of raising on every accepted connection.
+
 ### 0.8.0
 
 **New: firmware capture.** Set `CYNC_FIRMWARE_CAPTURE_DIR` and the server

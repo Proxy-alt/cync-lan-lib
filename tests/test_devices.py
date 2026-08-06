@@ -1651,3 +1651,120 @@ async def test_mesh_info_stays_quiet_for_ordinary_single_element_devices(caplog)
         )
 
     assert "sub-element" not in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# Cloud passthrough
+# ---------------------------------------------------------------------------
+
+
+def test_passthrough_toggle_reads_the_environment_at_call_time(monkeypatch):
+    """The whole point of not freezing this at import: flipping the option
+    has to take effect on a config-entry reload, not a full restart."""
+    monkeypatch.delenv("CYNC_CLOUD_PASSTHROUGH", raising=False)
+    assert devices._cloud_passthrough_enabled() is devices.CYNC_CLOUD_PASSTHROUGH
+
+    for truthy in ("1", "true", "TRUE", "yes", "on", " On "):
+        monkeypatch.setenv("CYNC_CLOUD_PASSTHROUGH", truthy)
+        assert devices._cloud_passthrough_enabled() is True, truthy
+
+    for falsy in ("0", "false", "no", "off", ""):
+        monkeypatch.setenv("CYNC_CLOUD_PASSTHROUGH", falsy)
+        assert devices._cloud_passthrough_enabled() is False, falsy
+
+
+def test_cloud_endpoint_overrides_and_survives_a_bad_port(monkeypatch):
+    monkeypatch.delenv("CYNC_CLOUD_IP", raising=False)
+    monkeypatch.delenv("CYNC_CLOUD_PORT", raising=False)
+    assert devices._cloud_endpoint() == (devices.CYNC_CLOUD_IP, devices.CYNC_CLOUD_PORT)
+
+    monkeypatch.setenv("CYNC_CLOUD_IP", "10.0.0.9")
+    monkeypatch.setenv("CYNC_CLOUD_PORT", "23778")
+    assert devices._cloud_endpoint() == ("10.0.0.9", 23778)
+
+    # A typo in the port must not take the whole server down with a
+    # ValueError on every accepted connection.
+    monkeypatch.setenv("CYNC_CLOUD_PORT", "twenty-three-seven-seven-nine")
+    assert devices._cloud_endpoint() == ("10.0.0.9", devices.CYNC_CLOUD_PORT)
+
+
+async def test_mitm_logger_survives_a_session_with_no_node_yet(tmp_path, monkeypatch):
+    """Regression: passthrough sets the logger up while the session is still
+    being accepted, which is before the device has identified itself. Every
+    self.node reference on that path used to be unguarded."""
+    monkeypatch.setattr(devices, "CYNC_MITM_LOG_DIR", str(tmp_path))
+    session = _fake_session(node=None)
+    session._setup_mitm_logger()
+    assert session.mitm_logger is not None
+    assert any(tmp_path.iterdir()), "expected a log file named after the address"
+
+
+async def test_enable_passthrough_stays_local_when_the_cloud_is_unreachable(
+    tmp_path, monkeypatch
+):
+    """A cloud that will not answer is not a reason to stop controlling
+    lights - the session carries on in ordinary local-only mode."""
+    monkeypatch.setattr(devices, "CYNC_MITM_LOG_DIR", str(tmp_path))
+    session = _fake_session(node=None)
+    with patch.object(
+        devices.asyncio, "open_connection", side_effect=OSError("no route to host")
+    ):
+        assert await session.enable_passthrough() is False
+    assert session.mitm_mode is False
+    assert session.cloud_writer is None
+
+
+async def test_enable_passthrough_is_idempotent(tmp_path, monkeypatch):
+    monkeypatch.setattr(devices, "CYNC_MITM_LOG_DIR", str(tmp_path))
+    session = _fake_session(node=None)
+    session.mitm_mode = True
+    session.cloud_writer = MagicMock()
+    with patch.object(devices.asyncio, "open_connection") as opened:
+        assert await session.enable_passthrough() is True
+    opened.assert_not_called()
+
+
+async def test_start_tasks_relays_before_the_first_read(tmp_path, monkeypatch):
+    """The relay has to be up before receive_task exists, or the cloud gets a
+    stream whose handshake it never saw."""
+    monkeypatch.setattr(devices, "CYNC_MITM_LOG_DIR", str(tmp_path))
+    monkeypatch.setenv("CYNC_CLOUD_PASSTHROUGH", "1")
+    session = _fake_session(node=None)
+    order: list[str] = []
+
+    async def _enable():
+        order.append("passthrough")
+        return True
+
+    async def _receive():
+        order.append("receive")
+
+    session.enable_passthrough = _enable
+    session.receive_task = _receive
+    session.callback_cleanup_task = _receive
+    await session.start_tasks()
+    for task in (session.tasks.receive, session.tasks.callback_cleanup):
+        if task is not None:
+            await task
+
+    assert order[0] == "passthrough"
+
+
+async def test_start_tasks_leaves_sessions_alone_when_passthrough_is_off(
+    monkeypatch,
+):
+    monkeypatch.setenv("CYNC_CLOUD_PASSTHROUGH", "0")
+    session = _fake_session(node=None)
+    session.enable_passthrough = AsyncMock()
+
+    async def _noop():
+        return None
+
+    session.receive_task = _noop
+    session.callback_cleanup_task = _noop
+    await session.start_tasks()
+    for task in (session.tasks.receive, session.tasks.callback_cleanup):
+        if task is not None:
+            await task
+
+    session.enable_passthrough.assert_not_awaited()

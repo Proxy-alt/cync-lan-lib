@@ -14,6 +14,8 @@ from typing import Dict, List, Optional, Tuple, Union
 
 from cync_lan.const import (
     CYNC_CLOUD_IP,
+    CYNC_CLOUD_PASSTHROUGH,
+    CYNC_CLOUD_PORT,
     CYNC_CMD_BROADCASTS,
     CYNC_EXPERIMENTAL_LOG_PATH,
     CYNC_HUB_ENVELOPE,
@@ -338,6 +340,35 @@ def _hub_envelope_mode() -> str:
     CLI and Docker users who export it once still get what they asked for.
     """
     return os.environ.get("CYNC_HUB_ENVELOPE", CYNC_HUB_ENVELOPE).strip().casefold()
+
+
+def _cloud_passthrough_enabled() -> bool:
+    """Should new sessions be relayed to the vendor's cloud?
+
+    Re-read per session rather than frozen at import, for the same reason as
+    _hub_envelope_mode above: this is a thing people will want to turn on to
+    reproduce something and off again afterwards, and an import-time read
+    makes each flip cost a full Home Assistant restart.
+
+    Deliberately not cached on the session either. A session that started
+    before the option was turned on keeps whatever it started with, because
+    joining a stream halfway hands the cloud a conversation with no
+    handshake in front of it - see enable_passthrough's docstring.
+    """
+    raw = os.environ.get("CYNC_CLOUD_PASSTHROUGH")
+    if raw is None:
+        return CYNC_CLOUD_PASSTHROUGH
+    return raw.strip().casefold() in ("1", "true", "yes", "on")
+
+
+def _cloud_endpoint() -> tuple[str, int]:
+    """Where the real cloud lives, re-read alongside the toggle itself."""
+    host = os.environ.get("CYNC_CLOUD_IP", CYNC_CLOUD_IP).strip()
+    try:
+        port = int(os.environ.get("CYNC_CLOUD_PORT", CYNC_CLOUD_PORT))
+    except ValueError:
+        port = CYNC_CLOUD_PORT
+    return host, port
 
 
 def _warn_experimental_transport_unconfirmed(lp: str, name: str) -> None:
@@ -3374,7 +3405,13 @@ class CyncTCPSession:
             logger.debug(
                 f"{lp} MITM mode is active, making sure the proxy is started..."
             )
-            if self.node:
+            # g.mqtt_client is None for anyone running without MQTT (the CLI,
+            # and the HA integration before its bridge is up). This branch used
+            # to be reached only after someone pressed a per-device switch, by
+            # which point a client always existed; cloud passthrough puts every
+            # reconnect through it, so the None case is now ordinary rather
+            # than theoretical.
+            if self.node and g.mqtt_client is not None:
                 await g.mqtt_client.add_mitm_button(self.node)
             if not self.is_proxy_good():
                 await self.stop_proxy()
@@ -3390,11 +3427,12 @@ class CyncTCPSession:
             ssl_context.check_hostname = False
             ssl_context.verify_mode = ssl.CERT_NONE
 
+            cloud_host, cloud_port = _cloud_endpoint()
             logger.info(
-                f"{lp} Connecting to Cync Cloud via IP ({CYNC_CLOUD_IP}:23779)..."
+                f"{lp} Connecting to Cync Cloud via IP ({cloud_host}:{cloud_port})..."
             )
             self.cloud_reader, self.cloud_writer = await asyncio.open_connection(
-                CYNC_CLOUD_IP, 23779, ssl=ssl_context
+                cloud_host, cloud_port, ssl=ssl_context
             )
             self.tasks.proxy_task = asyncio.create_task(
                 self._cloud_proxy_task(),
@@ -3431,6 +3469,42 @@ class CyncTCPSession:
 
         else:
             self.mitm_mode = True
+
+    async def enable_passthrough(self) -> bool:
+        """Relay this session to the cloud from its first byte.
+
+        The difference from start_mitm() is the missing reconnect. That
+        method exists to be flicked on mid-session by a switch entity, and
+        it has to hang up afterwards: the device is already several packets
+        into a handshake with us, so the cloud would receive a conversation
+        starting from the middle and reject it. Forcing a reconnect makes
+        the device start over with the proxy in place from the beginning.
+
+        The option this serves has no such problem. It is consulted while a
+        freshly accepted session is being wired up, before its receive task
+        exists and therefore before a single byte has been read, so the
+        handshake reaches the cloud intact and hanging up would only produce
+        a reconnect loop.
+
+        Returns whether the relay is up. False leaves the session in
+        ordinary local-only mode rather than failing it - the cloud being
+        unreachable is not a reason to stop controlling lights.
+        """
+        lp = f"{self.lp}passthrough:"
+        if self.mitm_mode and self.cloud_writer:
+            return True
+        self._setup_mitm_logger()
+        await self.start_proxy()
+        if not self.cloud_writer:
+            # start_proxy() logs the cause and cleans up after itself.
+            logger.warning(
+                f"{lp} could not reach the cloud - continuing without passthrough "
+                "for this session. Local control is unaffected."
+            )
+            return False
+        self.mitm_mode = True
+        logger.info(f"{lp} relaying this session to the cloud")
+        return True
 
     def is_proxy_good(self):
         if self.tasks.proxy_task and not self.tasks.proxy_task.done():
@@ -3568,18 +3642,22 @@ class CyncTCPSession:
     def _setup_mitm_logger(self):
         """Initializes a rotating file logger for this specific connection."""
         lp = f"{self.lp}mitm logger:"
+        # Every reference to self.node here is guarded. The only caller used
+        # to be start_mitm(), reachable from a per-node switch entity and so
+        # never without one; cloud passthrough calls this while the session
+        # is still being accepted, which is before the device has said who it
+        # is. Unguarded, `identifier` was simply never assigned on that path
+        # (UnboundLocalError below) and the two log lines dereferenced None.
+        node_id = getattr(self.node, "id", None)
         if self.mitm_logger:
-            logger.debug(
-                f"{lp} Already setup for Node: '{self.name}' (ID: {self.node.id})"
-            )
+            logger.debug(f"{lp} Already setup for Node: '{self.name}' (ID: {node_id})")
             return
-        # Differentiate between App (by IP) and Device (by ID)
-        conn_type = "dev"
-        if self.is_app:
-            conn_type = "app"
-            identifier = f"{conn_type}_{self.ip_address.replace('.', '-')}"
-        elif self.node:
-            identifier = f"{conn_type}_{self.node.id}"
+        # Differentiate between App (by IP) and Device (by ID), falling back
+        # to the address when the node is not known yet - it always resolves,
+        # and a session only ever has one address.
+        conn_type = "app" if self.is_app else "dev"
+        by_address = f"{conn_type}_{self.ip_address.replace('.', '-')}"
+        identifier = by_address if node_id is None else f"{conn_type}_{node_id}"
         logger_name = f"MITM {conn_type}:{self.ip_address}"
         mitm_logger = logging.getLogger(logger_name)
         self.mitm_logger = mitm_logger
@@ -3616,7 +3694,7 @@ class CyncTCPSession:
             self.mitm_logger.addHandler(stdout_handler)
         os.chmod(log_file, 0o777)
         logger.debug(
-            f"Created a MITM logger for node: '{self.name}' (ID: {self.node.id}) -> {log_file}"
+            f"Created a MITM logger for node: '{self.name}' (ID: {node_id}) -> {log_file}"
         )
 
     async def blackhole(self, should_sleep: bool):
@@ -3713,6 +3791,18 @@ class CyncTCPSession:
                 await self.tasks.dev_conn_watcher
             except asyncio.CancelledError:
                 pass
+
+        # Cloud passthrough, if it is switched on. This has to happen here and
+        # not in receive_task: the relay must be in place before the first
+        # read, or the cloud gets a stream whose handshake it never saw. By
+        # this point the session is fully constructed and no byte has been
+        # consumed, which is the only window where that is true.
+        #
+        # Sessions already relaying (existing_init restarting a proxy, or the
+        # per-device switch) are left alone - enable_passthrough is a no-op
+        # for them.
+        if _cloud_passthrough_enabled() and not self.mitm_mode:
+            await self.enable_passthrough()
 
         # python will garbage collect the task if you dont keep a reference
         self.tasks.receive = asyncio.create_task(
