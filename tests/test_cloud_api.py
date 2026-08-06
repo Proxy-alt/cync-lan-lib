@@ -13,8 +13,11 @@ from __future__ import annotations
 import datetime
 import hashlib
 import json
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
+import pytest
+
+from cync_lan import cloud_api
 from cync_lan.cloud_api import (
     CyncCloudAPI,
     _decode_sensor_schedule_slot,
@@ -529,3 +532,87 @@ async def test_capture_firmware_has_no_way_to_reach_a_device():
     )
     for forbidden in ("send(", "write(", "0x4F", "StartHubFirmware", "ota_start"):
         assert forbidden not in src, f"capture path references {forbidden!r}"
+
+
+# ---------------------------------------------------------------------------
+# OTP codes are strings, not integers
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def _credentials(monkeypatch):
+    """cloud_api binds these at import, so patch the module's own names."""
+    monkeypatch.setattr(cloud_api, "CYNC_ACCOUNT_USERNAME", "user@example.com")
+    monkeypatch.setattr(cloud_api, "CYNC_ACCOUNT_PASSWORD", "correct horse battery")
+
+
+async def _sent_otp(code, monkeypatch):
+    """Run send_otp and return what it put in the request body.
+
+    Stubs go through monkeypatch rather than plain assignment because
+    CyncCloudAPI is a process-wide singleton - a direct `api._send_tkn_post =
+    ...` outlives the test and every later one gets the stub. Caught exactly
+    that way: these passed alone and broke test_error_paths.py in the full
+    suite.
+    """
+    captured = {}
+
+    async def _post(url, data, lp=None):
+        captured.update(data)
+        return True
+
+    api = cloud_api.CyncCloudAPI()
+    monkeypatch.setattr(api, "_check_session", AsyncMock(return_value=None))
+    monkeypatch.setattr(api, "_send_tkn_post", _post)
+    ok = await api.send_otp(code)
+    return ok, captured
+
+
+async def test_a_leading_zero_otp_survives_to_the_wire(_credentials, monkeypatch):
+    """Reported by @baudneo on PR #1. int("012345") is 12345 - six digits
+    become five, and the vendor rejects it with nothing to explain why."""
+    ok, sent = await _sent_otp("012345", monkeypatch)
+    assert ok is True
+    assert sent["two_factor"] == "012345"
+
+
+async def test_an_all_zero_otp_is_not_mistaken_for_a_missing_one(_credentials, monkeypatch):
+    """The nastier form of the same bug: "000000" coerced to 0, hit the
+    falsy check, and was reported as "OTP code must be provided" for a code
+    the user had typed correctly."""
+    ok, sent = await _sent_otp("000000", monkeypatch)
+    assert ok is True
+    assert sent["two_factor"] == "000000"
+
+
+async def test_integer_codes_are_still_accepted_and_padded(_credentials, monkeypatch):
+    """Callers have been passing ints. One that never had a leading zero is
+    unharmed; one that already lost it cannot be recovered here."""
+    ok, sent = await _sent_otp(123456, monkeypatch)
+    assert ok is True
+    assert sent["two_factor"] == "123456"
+
+
+async def test_the_password_is_truncated_to_sixteen_characters(_credentials, monkeypatch):
+    """PR #1: the vendor started rejecting longer passwords with a 400."""
+    _, sent = await _sent_otp("123456", monkeypatch)
+    assert sent["password"] == "correct horse ba"
+    assert len(sent["password"]) == 16
+
+
+async def test_a_non_numeric_code_is_refused(_credentials, monkeypatch):
+    api = cloud_api.CyncCloudAPI()
+    monkeypatch.setattr(api, "_check_session", AsyncMock(return_value=None))
+    assert await api.send_otp("12ab56") is False
+    assert await api.send_otp("   ") is False
+
+
+async def test_missing_credentials_are_reported_not_raised(monkeypatch):
+    """The truncation subscripts the password, and it defaults to None, so an
+    unconfigured account raised TypeError instead of saying what was wrong.
+    request_otp has always guarded this; send_otp only started needing to."""
+    monkeypatch.setattr(cloud_api, "CYNC_ACCOUNT_USERNAME", None)
+    monkeypatch.setattr(cloud_api, "CYNC_ACCOUNT_PASSWORD", None)
+    api = cloud_api.CyncCloudAPI()
+    monkeypatch.setattr(api, "_check_session", AsyncMock(return_value=None))
+    assert await api.send_otp("123456") is False

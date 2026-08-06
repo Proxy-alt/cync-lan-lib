@@ -9,7 +9,7 @@ import random
 import signal
 import string
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 import aiohttp
 import yaml
@@ -267,18 +267,48 @@ class CyncCloudAPI:
             lp=f"{self.lp}:refresh token:",
         )
 
-    async def send_otp(self, otp_code: int) -> bool:
+    async def send_otp(self, otp_code: Union[str, int]) -> bool:
+        """Complete the two-factor exchange.
+
+        The code is carried as a **string** all the way to the wire. It was
+        typed `int` and coerced with `int(otp_code)`, which silently destroys
+        any code the vendor issues with a leading zero - `int("012345")` is
+        `12345`, six digits become five, and the API rejects it with no clue
+        why. `"000000"` was worse still: it coerced to `0`, tripped the
+        falsy check below, and was reported as "OTP code must be provided"
+        for a code the user had entered correctly.
+
+        Reported by @baudneo in the description of Proxy-alt/cync-lan-lib#1,
+        alongside the password truncation that PR fixes.
+
+        Integers are still accepted, since callers have been passing them,
+        but they are formatted back to six digits rather than trusted - an
+        int that has already lost its leading zero cannot be recovered here,
+        so this only helps callers that never lost it.
+        """
         lp = f"{self.lp}:send_otp:"
         await self._check_session()
-        if not otp_code:
+        if otp_code is None or (isinstance(otp_code, str) and not otp_code.strip()):
             logger.error("OTP code must be provided")
             return False
-        elif not isinstance(otp_code, int):
-            try:
-                otp_code = int(otp_code)
-            except ValueError:
-                logger.error(f"{lp} OTP code must be an integer, got {type(otp_code)}")
-                return False
+        if isinstance(otp_code, int):
+            otp_code = f"{otp_code:06d}"
+        else:
+            otp_code = otp_code.strip()
+        if not otp_code.isdigit():
+            logger.error(f"{lp} OTP code must be digits, got {otp_code!r}")
+            return False
+        # Both default to None when unset, and the truncation below
+        # subscripts the password - so an unconfigured account turned a
+        # clear "credentials not set" into TypeError: 'NoneType' object is
+        # not subscriptable. request_otp has guarded this since it was
+        # written; send_otp never did, and only started needing to when the
+        # slice arrived.
+        if not CYNC_ACCOUNT_USERNAME or not CYNC_ACCOUNT_PASSWORD:
+            logger.error(
+                f"{lp} Cync account username or password not set, cannot send OTP!"
+            )
+            return False
 
         api_auth_url = f"{CYNC_API_BASE}user_auth/two_factor"
         auth_data = {

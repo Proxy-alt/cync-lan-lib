@@ -7,7 +7,26 @@ Assistant `cync_lan` custom_component's own version scheme - all three are
 versioned and released separately. See the root `README.md`/`RELEASING.md`
 on `feature/ha-custom-component` for how the three artifacts relate.
 
-### 0.10.0
+### 0.10.1
+
+**OTP codes are strings now, and the account check happens before the password
+is touched.** Both come out of @baudneo's [#1](https://github.com/Proxy-alt/cync-lan-lib/pull/1),
+merged here - the password truncation it fixes plus the second bug he flagged
+in the description and one the truncation exposed.
+
+- `send_otp` took `otp_code: int` and coerced with `int(otp_code)`, which
+  destroys a leading zero: `int("012345")` is `12345`, six digits become five,
+  and the vendor rejects it with nothing to explain why. `"000000"` was worse -
+  it coerced to `0`, tripped the falsy check, and was reported back as "OTP code
+  must be provided" for a code the user had entered correctly. The code is now
+  carried as a string end to end. Integers are still accepted and re-padded,
+  though one that already lost its leading zero cannot be recovered.
+- `CYNC_ACCOUNT_PASSWORD` defaults to `None`, and the new `[:16]` subscripts it,
+  so an unconfigured account raised `TypeError: 'NoneType' object is not
+  subscriptable` where it used to send `None` and get a normal API error.
+  `request_otp` has guarded this since it was written; `send_otp` never did and
+  only started needing to.
+
 
 **New: `cync_lan.testing`** - a virtual Cync device and a fake Cync cloud, both
 real sockets. `VirtualCyncDevice` connects to an `nCyncServer` and plays the
