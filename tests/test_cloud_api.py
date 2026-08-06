@@ -576,7 +576,9 @@ async def test_a_leading_zero_otp_survives_to_the_wire(_credentials, monkeypatch
     assert sent["two_factor"] == "012345"
 
 
-async def test_an_all_zero_otp_is_not_mistaken_for_a_missing_one(_credentials, monkeypatch):
+async def test_an_all_zero_otp_is_not_mistaken_for_a_missing_one(
+    _credentials, monkeypatch
+):
     """The nastier form of the same bug: "000000" coerced to 0, hit the
     falsy check, and was reported as "OTP code must be provided" for a code
     the user had typed correctly."""
@@ -593,7 +595,9 @@ async def test_integer_codes_are_still_accepted_and_padded(_credentials, monkeyp
     assert sent["two_factor"] == "123456"
 
 
-async def test_the_password_is_truncated_to_sixteen_characters(_credentials, monkeypatch):
+async def test_the_password_is_truncated_to_sixteen_characters(
+    _credentials, monkeypatch
+):
     """PR #1: the vendor started rejecting longer passwords with a 400."""
     _, sent = await _sent_otp("123456", monkeypatch)
     assert sent["password"] == "correct horse ba"
