@@ -7,6 +7,41 @@ Assistant `cync_lan` custom_component's own version scheme - all three are
 versioned and released separately. See the root `README.md`/`RELEASING.md`
 on `feature/ha-custom-component` for how the three artifacts relate.
 
+### Unreleased
+
+**Tests that scale past hand-written cases.** No source changes - two additions
+to the suite, both aimed at the same problem: `devices.py` is 2138 statements
+at 60% coverage, and closing that by writing one check per path is not a thing
+anyone finishes.
+
+`test_framing.py` cuts a two-packet stream at **every** offset rather than at a
+chosen one. The e2e suite splits at 2 bytes because that is the case the
+comment in `parse_raw_data` describes, but TCP does not split where you ask it
+to and the offset that bites in production is the one nobody thought of. The
+input space is enumerable, so this is exhaustive rather than sampled: 74 split
+points, plus byte-at-a-time delivery through the header, leading junk, and a
+header promising more than arrived.
+
+`test_structural.py` reads the package's own AST and checks the two bug
+*classes* that actually recurred, everywhere, including code not yet written:
+
+- `await`ing a just-cancelled task under `except Exception` - the 0.9.2
+  `stop_proxy()` bug, which was written twice in one function.
+- dereferencing `self.node` on a path that runs before the device has
+  identified itself - which bit three times, in `_setup_mitm_logger`,
+  `existing_init` and `start_proxy`, each fixed alone without asking where else
+  it was true.
+
+The second walks the call graph from six accept-time roots and reaches 28
+methods, so adding a helper to that path brings it under the check
+automatically rather than when someone remembers. Both were verified by
+mutation - reintroduce either bug and the matching test fails, naming file,
+line and method - because a structural test that passes trivially is worse than
+none.
+
+Neither moves the coverage number. Structural tests execute no product code at
+all, which is the point: they cover a shape rather than a line.
+
 ### 0.9.2
 
 **End-to-end tests: a real server, a real socket, a device on the other end.**
