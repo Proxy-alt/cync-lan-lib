@@ -7,7 +7,20 @@ Assistant `cync_lan` custom_component's own version scheme - all three are
 versioned and released separately. See the root `README.md`/`RELEASING.md`
 on `feature/ha-custom-component` for how the three artifacts relate.
 
-### Unreleased
+### 0.10.0
+
+**New: `cync_lan.testing`** - a virtual Cync device and a fake Cync cloud, both
+real sockets. `VirtualCyncDevice` connects to an `nCyncServer` and plays the
+device side of the handshake; `FakeCloud` stands in for the vendor and records
+what a relayed session forwards to it.
+
+Shipped rather than kept in this package's own tests, because the Home
+Assistant integration needs the same thing to test its own layer, and the
+protocol lives here. A copy in the other repository would drift from the parser
+it exists to exercise, which is the one failure a protocol simulator cannot
+afford. Import costs nothing at runtime - no test framework is involved, and
+`cryptography` is already required by the server for its own certificate.
+
 
 **Tests that scale past hand-written cases.** No source changes - two additions
 to the suite, both aimed at the same problem: `devices.py` is 2138 statements
