@@ -46,6 +46,8 @@ __all__ = [
     "CYNC_DEBUG",
     "CYNC_CORP_ID",
     "CYNC_CLOUD_IP",
+    "CYNC_CLOUD_PORT",
+    "CYNC_CLOUD_PASSTHROUGH",
     "DATA_BOUNDARY",
     "RAW_MSG",
     "CYNC_LOG_NAME",
@@ -221,6 +223,23 @@ CYNC_EXPERIMENTAL_LOG_PATH = os.environ.get(
     "CYNC_EXPERIMENTAL_LOG_PATH", f"{CYNC_CONFIG_DIR}/experimental_features.log"
 )
 CYNC_CLOUD_IP = os.environ.get("CYNC_CLOUD_IP", "34.73.130.191")
+# An IP rather than a hostname on purpose: cloud passthrough only exists in
+# setups where the vendor's hostnames have been redirected to this server, so
+# resolving cm.gelighting.com here would loop straight back to us.
+CYNC_CLOUD_PORT = int(os.environ.get("CYNC_CLOUD_PORT", 23779))
+
+# Cloud passthrough. When on, every accepted session is relayed to the real
+# cloud from its first byte while cync-lan goes on parsing and controlling
+# locally - the existing per-device MITM switch, applied to everything and
+# without the forced reconnect that switch needs.
+#
+# Read where it is used rather than frozen here (see devices.py's
+# _cloud_passthrough_enabled), so flipping it costs a config-entry reload
+# rather than a full restart. This constant is only the fallback for CLI and
+# Docker users who export the variable once.
+CYNC_CLOUD_PASSTHROUGH: bool = os.environ.get(
+    "CYNC_CLOUD_PASSTHROUGH", "0"
+).strip().casefold() in ("1", "true", "yes", "on")
 
 # Second byte of each tuple is a random nonce in the real app (SetLightRunModeCommand.x()
 # writes Random.nextInt(-128,127) there) - the receiving device doesn't validate it, confirmed
