@@ -9,7 +9,7 @@ import random
 import signal
 import string
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import aiohttp
 import yaml
@@ -135,7 +135,7 @@ class CyncCloudAPI:
             cls._instance = super().__new__(cls)
         return cls._instance
 
-    def __init__(self, **kwargs):
+    def __init__(self, **kwargs: Any) -> None:
         self.api_timeout = kwargs.get("api_timeout", 8)
         self.lp = kwargs.get("lp", self.lp)
         session = kwargs.get("session")

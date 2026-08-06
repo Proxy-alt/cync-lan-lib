@@ -3420,7 +3420,7 @@ class CyncTCPSession:
             else:
                 logger.debug(f"{lp} Proxy connection is up!")
 
-    async def start_proxy(self):
+    async def start_proxy(self) -> None:
         lp = f"{self.lp}start proxy:"
         try:
             ssl_context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
@@ -3446,7 +3446,7 @@ class CyncTCPSession:
             logger.error(f"{lp} Failed to start MITM: {e}")
             await self.stop_proxy()
 
-    async def start_mitm(self):
+    async def start_mitm(self) -> None:
         """Connect to Cync Cloud and start proxying."""
         lp = f"{self.lp}mitm:start:"
         if self.mitm_mode and self.cloud_writer:
@@ -3506,7 +3506,7 @@ class CyncTCPSession:
         logger.info(f"{lp} relaying this session to the cloud")
         return True
 
-    def is_proxy_good(self):
+    def is_proxy_good(self) -> bool:
         if self.tasks.proxy_task and not self.tasks.proxy_task.done():
             logger.debug(f"{self.lp} Proxy task is active!")
         elif not self.tasks.proxy_task:
@@ -3543,7 +3543,7 @@ class CyncTCPSession:
 
         return True
 
-    async def stop_proxy(self):
+    async def stop_proxy(self) -> None:
         lp = f"{self.lp}stop proxy:"
         if self.tasks.proxy_task and not self.tasks.proxy_task.done():
             logger.debug(f"{lp} Cancelling proxy task...")
@@ -3591,7 +3591,7 @@ class CyncTCPSession:
         self.mitm_bytes_from_cloud = 0
         logger.debug(f"{lp} Proxy closed!")
 
-    async def stop_mitm(self):
+    async def stop_mitm(self) -> None:
         """Close cloud connection and stop proxying."""
         lp = f"{self.lp}close mitm:"
         logger.debug(f"{lp} closing...")

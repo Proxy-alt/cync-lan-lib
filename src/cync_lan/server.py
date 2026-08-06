@@ -371,7 +371,7 @@ class nCyncServer:
         ssl_context.set_ciphers(":".join(ciphers))
         return ssl_context
 
-    async def start(self):
+    async def start(self) -> None:
         lp = f"{self.lp}start:"
         logger.debug(
             f"{lp} Creating SSL context - key: {self.key_file}, cert: {self.cert_file}"
@@ -414,7 +414,7 @@ class nCyncServer:
                     f"{lp} DEBUG>>> AFTER self._server.serve_forever() <<<DEBUG"
                 )
 
-    async def stop(self):
+    async def stop(self) -> None:
         try:
             self.shutting_down = True
             lp = f"{self.lp}stop:"

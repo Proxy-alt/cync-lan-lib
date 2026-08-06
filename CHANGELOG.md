@@ -7,6 +7,30 @@ Assistant `cync_lan` custom_component's own version scheme - all three are
 versioned and released separately. See the root `README.md`/`RELEASING.md`
 on `feature/ha-custom-component` for how the three artifacts relate.
 
+### 0.9.1
+
+**Type annotations on the public entry points**, so consumers type-checking
+their own code stop being penalised for calling into this one. `mypy` reports
+`no-untyped-call` at every call site of an unannotated function, which put six
+errors in the Home Assistant integration that were entirely about this
+package's missing `-> None`s: `CyncCloudAPI.__init__`, `nCyncServer.start` /
+`stop`, and `CyncTCPSession.start_mitm` / `stop_mitm` / `start_proxy` /
+`stop_proxy` / `is_proxy_good`.
+
+No behaviour change - annotations only.
+
+**`docs/` re-synced from the integration repository.** The two copies are
+compared by CI on both sides and had drifted 376 lines apart, all of it work
+that landed in `Proxy-alt/cync-lan` and never came back here: four new
+documents, plus `hardware_verification.md` recording `identify` as the second
+command confirmed against real hardware. The check names this repository
+canonical, so the drift was pointing the wrong way.
+
+One content note: the checkmarks in `mesh_opcodes.md` are gone. The
+integration repository bans them (`U+2713` falls inside the dingbats range its
+`test_no_emojis` covers), which made the two checks unsatisfiable at once -
+matching the canonical copy required text that the other test rejected.
+
 ### 0.9.0
 
 **New: cloud passthrough (`CYNC_CLOUD_PASSTHROUGH`).** Every accepted session
