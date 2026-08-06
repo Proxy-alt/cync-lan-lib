@@ -7,6 +7,49 @@ Assistant `cync_lan` custom_component's own version scheme - all three are
 versioned and released separately. See the root `README.md`/`RELEASING.md`
 on `feature/ha-custom-component` for how the three artifacts relate.
 
+### 0.9.2
+
+**End-to-end tests: a real server, a real socket, a device on the other end.**
+`tests/simulator.py` plays the device half of a connection over TLS and
+`FakeCloud` stands in for the vendor, so `nCyncServer` can be exercised
+through asyncio's own transport instead of around it. Everything else in the
+suite either hands bytes straight to a parser or mocks the transport away -
+`test_server.py` patches `asyncio.start_server`, `test_devices.py` patches
+`open_connection` - which left the TLS handshake, packet framing across TCP
+read boundaries, the session lifecycle and the cloud relay with no coverage at
+all.
+
+It found two bugs on its first run, both in code shipped in 0.9.0:
+
+- **`stop_proxy()` abandoned its own teardown.** Both awaits caught
+  `Exception`, which has not included `asyncio.CancelledError` since Python
+  3.8 - and awaiting a task you just cancelled is exactly how you get one. So
+  the first await raised straight back out: the cloud writer was never closed,
+  the connection watcher kept running, and the caller (`stop_mitm`, and
+  `close()` through it) saw its own shutdown cancelled. Invisible to the
+  existing tests because a mocked `open_connection` leaves the proxy task with
+  nothing to be cancelled out of.
+- **`start_proxy()` built its task name from `self.node.id`.** The third place
+  this bit, after `_setup_mitm_logger` and `existing_init` in 0.9.0. Being only
+  a task *name* made it worse, not better: the `AttributeError` surfaced as
+  "failed to start MITM" and the session silently fell back to local-only.
+
+The five tests assert the handshake over TLS, reassembly of a packet split
+inside its own header (the case `parse_raw_data`'s comment describes from a
+real capture, until now untested because TCP will not split where you ask it
+to), and the three claims cloud passthrough is built on: the cloud sees the
+handshake from its first byte, cync-lan stops answering for itself while
+relaying, and an unreachable cloud degrades to local-only rather than failing
+the connection.
+
+**What it is not.** The simulator is built from this repository's own
+understanding of the protocol, so it can only confirm we are consistent with
+ourselves. It is a regression net around what hardware already confirmed, and
+it is not evidence about colour temperature, RGB, the hub family, or any of
+the unconfirmed experimental commands - feed it our assumptions and it will
+agree with our bugs. `docs/hardware_verification.md` stays the document that
+decides what is real.
+
 ### 0.9.1
 
 **Type annotations on the public entry points**, so consumers type-checking

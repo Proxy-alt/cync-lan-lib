@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import datetime
 import logging
 import logging.handlers
@@ -3434,9 +3435,19 @@ class CyncTCPSession:
             self.cloud_reader, self.cloud_writer = await asyncio.open_connection(
                 cloud_host, cloud_port, ssl=ssl_context
             )
+            # getattr, not self.node.id: the third place this bit. Every
+            # caller used to arrive from a per-node switch entity, so a node
+            # always existed by the time the proxy started. Cloud passthrough
+            # starts it while the session is still being accepted, before the
+            # device has identified itself - and because this is only a task
+            # *name*, the AttributeError surfaced as "failed to start MITM"
+            # with the real cause buried, then silently fell back to
+            # local-only. Caught by tests/test_e2e_session.py, which is the
+            # first thing to run this path over a real socket.
+            node_id = getattr(self.node, "id", None)
             self.tasks.proxy_task = asyncio.create_task(
                 self._cloud_proxy_task(),
-                name=f"proxy_task-{self.ip_address}_ID:{self.node.id}",
+                name=f"proxy_task-{self.ip_address}_ID:{node_id}",
             )
             self.tasks.proxy_conn_watcher = asyncio.create_task(
                 self.connection_watcher_task(ConnectionType.proxy),
@@ -3544,24 +3555,34 @@ class CyncTCPSession:
         return True
 
     async def stop_proxy(self) -> None:
+        # Both awaits below caught `Exception`, which does NOT include
+        # asyncio.CancelledError - it has inherited from BaseException since
+        # Python 3.8. Awaiting a task you just cancelled is precisely how you
+        # get one, so every stop_proxy() call raised CancelledError out of the
+        # first await and abandoned the rest of its own teardown: the cloud
+        # writer was never closed, the connection watcher kept running, and
+        # the caller (stop_mitm, and close() through it) saw its own shutdown
+        # cancelled. _cloud_proxy_task already handles cancellation correctly
+        # and says why; this is the same lesson one frame up.
+        #
+        # Found by tests/test_e2e_session.py - a real socket meant the proxy
+        # task was genuinely mid-read at cancellation, which is when this
+        # fires. The existing tests mock open_connection, so the task never
+        # had anything to be cancelled out of.
         lp = f"{self.lp}stop proxy:"
         if self.tasks.proxy_task and not self.tasks.proxy_task.done():
             logger.debug(f"{lp} Cancelling proxy task...")
             self.tasks.proxy_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self.tasks.proxy_task
-            except Exception:
-                pass
         self.tasks.proxy_task = None
         logger.debug(f"{lp} Proxy task stopped")
 
         if self.tasks.proxy_conn_watcher and not self.tasks.proxy_conn_watcher.done():
             logger.debug(f"{lp} Cancelling proxy connection watcher task...")
             self.tasks.proxy_conn_watcher.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self.tasks.proxy_conn_watcher
-            except Exception:
-                pass
             self.tasks.proxy_conn_watcher = None
             logger.debug(f"{lp} Proxy connection watcher task stopped")
 
