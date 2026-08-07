@@ -1800,9 +1800,13 @@ async def test_passthrough_still_writes_commands_to_the_device():
     g.mqtt_client = MagicMock()
 
     await broadcast_control_command(
-        target_id=1, sub_id=0, op=0xD0, cmd_=0x0D,
+        target_id=1,
+        sub_id=0,
+        op=0xD0,
+        cmd_=0x0D,
         payload=struct.pack(">BBBBB", 0x11, 0x02, 0x01, 0x00, 0x00),
-        m_cb=MagicMock(), lp="t:",
+        m_cb=MagicMock(),
+        lp="t:",
     )
 
     assert bridge.written, "passthrough dropped the command instead of sending it"
@@ -1821,9 +1825,13 @@ async def test_capture_mode_still_stays_off_the_wire():
     g.mqtt_client = MagicMock()
 
     await broadcast_control_command(
-        target_id=1, sub_id=0, op=0xD0, cmd_=0x0D,
+        target_id=1,
+        sub_id=0,
+        op=0xD0,
+        cmd_=0x0D,
         payload=struct.pack(">BBBBB", 0x11, 0x02, 0x01, 0x00, 0x00),
-        m_cb=MagicMock(), lp="t:",
+        m_cb=MagicMock(),
+        lp="t:",
     )
 
     assert bridge.written == [], "capture mode wrote to a session it should observe"
@@ -1834,9 +1842,9 @@ def test_observe_only_is_the_only_thing_that_silences_us():
     session = _fake_session(node=None)
     for mitm, passthrough, expected in (
         (False, False, False),  # ordinary session
-        (True, False, True),    # per-device capture switch
-        (True, True, False),    # cloud passthrough
-        (False, True, False),   # not reachable, but must not silence us
+        (True, False, True),  # per-device capture switch
+        (True, True, False),  # cloud passthrough
+        (False, True, False),  # not reachable, but must not silence us
     ):
         session.mitm_mode, session.passthrough = mitm, passthrough
         assert session.observe_only is expected, (mitm, passthrough)
