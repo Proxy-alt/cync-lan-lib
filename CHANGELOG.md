@@ -7,6 +7,40 @@ Assistant `cync_lan` custom_component's own version scheme - all three are
 versioned and released separately. See the root `README.md`/`RELEASING.md`
 on `feature/ha-custom-component` for how the three artifacts relate.
 
+### 0.10.3
+
+**An unwritable capture-log directory dropped every device.** Found by the
+integration's option matrix, and a genuine fault rather than a test artifact.
+
+`CYNC_MITM_LOG_DIR` is frozen at import from `CYNC_CONFIG_DIR`, which defaults
+to `/root/cync-lan/config` - not writable in a Home Assistant container, on a
+read-only root, or for any consumer that sets its config directory after
+`cync_lan.const` has already been imported. `_setup_mitm_logger()` called
+`mkdir` on it unguarded, so with cloud passthrough on:
+
+```
+FileNotFoundError: '/root/cync-lan/config/mitm_logs'
+OSError: [Errno 30] Read-only file system: '/root'
+ERROR cync_lan:server.py Error creating new Cync Wi-Fi device
+```
+
+The `OSError` escaped `enable_passthrough()`, escaped `start_tasks()`, and was
+swallowed by `_register_new_connection`'s broad handler - which meant the
+session was never registered at all. Not a missing log: **every device
+connection refused, for as long as the option was on**. `enable_passthrough`'s
+own docstring promised the opposite ("the cloud being unreachable is not a
+reason to stop controlling lights"); it guarded `start_proxy()` failing and
+never considered the logger.
+
+A capture log is a diagnostic convenience and can never be why a device stops
+working. The directory creation, the chmod and the handler open are each
+guarded now, each degrading to a warning, and `enable_passthrough` will not let
+anything from logging setup out.
+
+Verified by mutation: revert both guards and the new test fails; revert only
+the inner one and it still passes, because the outer guard catches it. Worth
+knowing the test pins the behaviour rather than either particular guard.
+
 ### 0.10.2
 
 **Fixes a bug in 0.9.0 that made cloud passthrough disable every device.**

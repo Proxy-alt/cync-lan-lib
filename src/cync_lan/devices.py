@@ -3526,7 +3526,10 @@ class CyncTCPSession:
         lp = f"{self.lp}passthrough:"
         if self.mitm_mode and self.cloud_writer:
             return True
-        self._setup_mitm_logger()
+        try:
+            self._setup_mitm_logger()
+        except Exception as exc:  # noqa: BLE001 - a logger must not cost a device
+            logger.warning(f"{lp} could not set up capture logging: {exc}")
         await self.start_proxy()
         if not self.cloud_writer:
             # start_proxy() logs the cause and cleans up after itself.
@@ -3715,9 +3718,26 @@ class CyncTCPSession:
             )
             return
         self.log_start_time = datetime.datetime.now().strftime("%Y%m%d")
+        # A capture log is a diagnostic convenience. Failing to create one
+        # must never cost the connection - and it did: CYNC_MITM_LOG_DIR is
+        # frozen at import from CYNC_CONFIG_DIR, which defaults to
+        # /root/cync-lan/config. Anywhere that path is not writable (a HA
+        # container, a read-only root, a consumer that sets its config dir
+        # after cync_lan.const was already imported) this mkdir raised, the
+        # OSError escaped enable_passthrough and start_tasks, and
+        # _register_new_connection logged it and never registered the device.
+        # With cloud passthrough on, that dropped EVERY device rather than
+        # just the relay.
         log_dir = Path(CYNC_MITM_LOG_DIR)
-        log_dir.mkdir(parents=True, exist_ok=True)
-        os.chmod(log_dir, 0o777)
+        try:
+            log_dir.mkdir(parents=True, exist_ok=True)
+            os.chmod(log_dir, 0o777)
+        except OSError as exc:
+            logger.warning(
+                f"{lp} cannot write capture logs to {log_dir} ({exc}); "
+                "continuing without them - traffic is unaffected"
+            )
+            return
         log_file = log_dir / f"mitm_{identifier}-{self.log_start_time}.log"
         formatter = logging.Formatter(
             "%(asctime)s.%(msecs)03d [%(name)s] %(message)s",
@@ -3727,9 +3747,16 @@ class CyncTCPSession:
         self.mitm_logger.setLevel(logging.DEBUG)
         self.mitm_logger.propagate = False
 
-        file_handler = logging.handlers.TimedRotatingFileHandler(
-            log_file, when="midnight"
-        )
+        try:
+            file_handler = logging.handlers.TimedRotatingFileHandler(
+                log_file, when="midnight"
+            )
+        except OSError as exc:
+            logger.warning(
+                f"{lp} cannot open {log_file} ({exc}); continuing without "
+                "capture logs - traffic is unaffected"
+            )
+            return
         file_handler.setFormatter(formatter)
         self.mitm_logger.addHandler(file_handler)
         if (CYNC_MITM_DEV_LOGGER and not self.is_app) or (
@@ -3739,7 +3766,8 @@ class CyncTCPSession:
             stdout_handler.setLevel(logging.DEBUG)
             stdout_handler.setFormatter(formatter)
             self.mitm_logger.addHandler(stdout_handler)
-        os.chmod(log_file, 0o777)
+        with contextlib.suppress(OSError):
+            os.chmod(log_file, 0o777)
         logger.debug(
             f"Created a MITM logger for node: '{self.name}' (ID: {node_id}) -> {log_file}"
         )

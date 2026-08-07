@@ -292,3 +292,42 @@ async def test_unreachable_cloud_leaves_the_session_local_only(
             assert session.queue_id == b"\x39\x87\xc8\x57"
     finally:
         await _shutdown(server, task)
+
+
+async def test_an_unwritable_capture_log_does_not_cost_the_device(
+    real_sockets, certs, monkeypatch, tmp_path
+):
+    """A diagnostic log must never be why a device stops working.
+
+    CYNC_MITM_LOG_DIR is frozen at import from CYNC_CONFIG_DIR, whose default
+    is /root/cync-lan/config - unwritable in a HA container, on a read-only
+    root, or for any consumer that sets its config dir after cync_lan.const
+    was imported. The mkdir raised, the OSError escaped enable_passthrough and
+    start_tasks, and _register_new_connection swallowed it without registering
+    the session. With passthrough on that dropped every device, not just the
+    relay.
+    """
+    unwritable = tmp_path / "not-a-dir"
+    unwritable.write_text("this is a file, so mkdir underneath it must fail")
+    monkeypatch.setattr(
+        "cync_lan.devices.CYNC_MITM_LOG_DIR", str(unwritable / "mitm"), raising=False
+    )
+    async with FakeCloud(*certs) as cloud:
+        monkeypatch.setenv("CYNC_CLOUD_PASSTHROUGH", "1")
+        monkeypatch.setenv("CYNC_CLOUD_IP", "127.0.0.1")
+        monkeypatch.setenv("CYNC_CLOUD_PORT", str(cloud.port))
+        server, port, task = await _serve(certs)
+        try:
+            async with VirtualCyncDevice("127.0.0.1", port) as device:
+                await device.send(build_23_auth())
+                await asyncio.sleep(0.3)
+
+                assert "127.0.0.1" in server.tcp_connections, (
+                    "an unwritable log directory dropped the whole session"
+                )
+                session = server.tcp_connections["127.0.0.1"]
+                assert session.queue_id == b"\x39\x87\xc8\x57"
+                # The relay itself is unaffected - only the log is missing.
+                assert await cloud.wait_for_bytes(1)
+        finally:
+            await _shutdown(server, task)
