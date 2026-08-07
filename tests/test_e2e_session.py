@@ -194,6 +194,42 @@ async def test_passthrough_relays_the_handshake_from_its_first_byte(
             await _shutdown(server, task)
 
 
+async def test_passthrough_still_reaches_the_device_with_commands(
+    real_sockets, certs, monkeypatch, tmp_path
+):
+    """Over a real socket, end to end: relaying must not silence us.
+
+    The unit test above pins the gate; this pins that a relayed session is
+    still a session we can write to. Both exist because the version that
+    shipped passed every test in the suite while making the option unusable.
+    """
+    monkeypatch.setattr(
+        "cync_lan.devices.CYNC_MITM_LOG_DIR", str(tmp_path / "mitm"), raising=False
+    )
+    async with FakeCloud(*certs) as cloud:
+        monkeypatch.setenv("CYNC_CLOUD_PASSTHROUGH", "1")
+        monkeypatch.setenv("CYNC_CLOUD_IP", "127.0.0.1")
+        monkeypatch.setenv("CYNC_CLOUD_PORT", str(cloud.port))
+        server, port, task = await _serve(certs)
+        try:
+            async with VirtualCyncDevice("127.0.0.1", port) as device:
+                await device.send(build_23_auth())
+                await cloud.wait_for_bytes(1)
+                session = server.tcp_connections["127.0.0.1"]
+
+                assert session.mitm_mode is True
+                assert session.passthrough is True
+                assert session.observe_only is False, (
+                    "a relayed session must still be writable"
+                )
+
+                # The write path itself, not just the flag.
+                await session.write(b"\x73\x00\x00\x00\x01\x00")
+                assert await device.read_packet(timeout=3.0) is not None
+        finally:
+            await _shutdown(server, task)
+
+
 async def test_passthrough_leaves_the_acks_to_the_cloud(
     real_sockets, certs, monkeypatch, tmp_path
 ):

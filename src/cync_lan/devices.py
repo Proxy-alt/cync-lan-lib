@@ -641,7 +641,7 @@ async def broadcast_control_command(
                 bridge_device.node.id if bridge_device.node else "unidentified"
             )
 
-            if bridge_device.mitm_mode is True:
+            if bridge_device.observe_only is True:
                 logger.debug(
                     f"{lp} MITM mode active for this device: {bridge_device.ip_address} (ID: {bridge_node_id})"
                     f" not writing data >>> \n\n{full_packet.hex(' ')}"
@@ -3330,6 +3330,7 @@ class CyncTCPSession:
     reader: Optional[asyncio.StreamReader]
     writer: Optional[asyncio.StreamWriter]
     mitm_mode: bool = False
+    passthrough: bool = False
     messages: MessageCache
     read_cache = []
     needs_more_data = False
@@ -3373,6 +3374,7 @@ class CyncTCPSession:
         self._closing = False
         self.control_bytes = [0x00, 0x00]
         self.mitm_mode = False
+        self.passthrough = False
         self.mitm_bytes_to_cloud = 0
         self.mitm_bytes_from_cloud = 0
         self.mitm_logger: Optional[logging.Logger] = None
@@ -3481,6 +3483,26 @@ class CyncTCPSession:
         else:
             self.mitm_mode = True
 
+    @property
+    def observe_only(self) -> bool:
+        """MITM capture mode: relay everything, and stay off the wire.
+
+        `mitm_mode` used to mean two things at once - "relay to the cloud"
+        and "send nothing of our own" - which was fine while its only caller
+        was the per-device capture switch. There the cloud drives the device
+        and anything we inject pollutes the capture, so silence is the point.
+
+        Cloud passthrough reused the same flag and inherited that silence,
+        which disabled every light in the house: commands were built, logged
+        and then dropped. The option exists to relay *and* keep working, so
+        the two meanings have to come apart.
+
+        Acks stay suppressed in both modes - the cloud answers the device's
+        handshake and a second ack from us would be a duplicate. Only our own
+        outbound traffic is at issue here.
+        """
+        return self.mitm_mode and not self.passthrough
+
     async def enable_passthrough(self) -> bool:
         """Relay this session to the cloud from its first byte.
 
@@ -3514,7 +3536,10 @@ class CyncTCPSession:
             )
             return False
         self.mitm_mode = True
-        logger.info(f"{lp} relaying this session to the cloud")
+        self.passthrough = True
+        logger.info(
+            f"{lp} relaying this session to the cloud, still controlling locally"
+        )
         return True
 
     def is_proxy_good(self) -> bool:
@@ -3610,6 +3635,7 @@ class CyncTCPSession:
 
         self.mitm_bytes_to_cloud = 0
         self.mitm_bytes_from_cloud = 0
+        self.passthrough = False
         logger.debug(f"{lp} Proxy closed!")
 
     async def stop_mitm(self) -> None:
@@ -4815,9 +4841,9 @@ class CyncTCPSession:
         the device to send its own status packet.
         """
         lp = f"{self.lp}"
-        if self.mitm_mode:
+        if self.observe_only is True:
             logger.debug(
-                f"{lp} MITM Mode active, not writing to the Cync TCP device..."
+                f"{lp} MITM capture mode active, not writing to the Cync TCP device..."
             )
             return
         if len(self.queue_id) != 4:
@@ -4917,7 +4943,7 @@ class CyncTCPSession:
         try:
             while True:
                 await asyncio.sleep(delay_seconds)
-                if self.mitm_mode:
+                if self.observe_only is True:
                     return
                 lp = f"{self.lp}callback_clean:"
                 now = time.time()

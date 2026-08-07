@@ -7,6 +7,34 @@ Assistant `cync_lan` custom_component's own version scheme - all three are
 versioned and released separately. See the root `README.md`/`RELEASING.md`
 on `feature/ha-custom-component` for how the three artifacts relate.
 
+### 0.10.2
+
+**Fixes a bug in 0.9.0 that made cloud passthrough disable every device.**
+Reported from a live install where nothing could be switched on while the
+option was enabled, with this in the log once per command per session:
+
+```
+set_power: MITM mode active for this device: 192.168.86.27 (ID: unidentified) not writing data >>>
+```
+
+`mitm_mode` meant two things at once - "relay to the cloud" and "send nothing
+of our own". That is right for the per-device MITM switch it was written for:
+the cloud drives the device there, and anything injected pollutes the capture.
+Cloud passthrough set the same flag and inherited the silence, so commands were
+built, logged and dropped. The 0.9.0 notes claimed it "goes on parsing the same
+traffic and controlling devices locally" - the parsing half was true and the
+controlling half was not.
+
+The two meanings are now separate. `observe_only` (`mitm_mode and not
+passthrough`) gates our own outbound traffic - commands, mesh-info requests,
+the control-callback sweep. Acks stay gated on `mitm_mode` in both modes,
+because the cloud answers the device's handshake and a second ack from us is a
+duplicate.
+
+Three tests, since the version that shipped passed the whole suite while being
+unusable: the truth table, the broadcast gate with a relayed session, and a
+socket-level check that a passthrough session is still writable.
+
 ### 0.10.1
 
 **OTP codes are strings now, and the account check happens before the password

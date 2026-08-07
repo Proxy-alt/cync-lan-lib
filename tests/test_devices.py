@@ -72,6 +72,10 @@ class _FakeBridgeDevice:
     def __init__(self):
         self.ready_to_control = True
         self.mitm_mode = False
+        # Mirrors CyncTCPSession.observe_only: relaying to the cloud AND
+        # staying off the wire. Passthrough sets mitm_mode without this, which
+        # is the whole point of the two being separate.
+        self.passthrough = False
         self.ip_address = "127.0.0.1"
         self.queue_id = b"\x00\x01\x02\x03"
         self.node = None
@@ -79,6 +83,10 @@ class _FakeBridgeDevice:
         self.messages.control = {}
         self._ctrl_byte = 0
         self.written = []
+
+    @property
+    def observe_only(self) -> bool:
+        return self.mitm_mode and not self.passthrough
 
     def get_ctrl_msg_id_bytes(self):
         self._ctrl_byte = (self._ctrl_byte + 1) % 256
@@ -1768,3 +1776,67 @@ async def test_start_tasks_leaves_sessions_alone_when_passthrough_is_off(
             await task
 
     session.enable_passthrough.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Passthrough relays AND keeps controlling; capture mode stays silent
+# ---------------------------------------------------------------------------
+
+
+async def test_passthrough_still_writes_commands_to_the_device():
+    """The bug that took a real house offline.
+
+    Cloud passthrough set mitm_mode, and the broadcast loop reads mitm_mode
+    to mean "stay off the wire" - so every command was built, logged and
+    dropped. Nothing could be turned on for as long as the option was on.
+    """
+    g = GlobalObject()
+    g.ncync_server = MagicMock()
+    bridge = _FakeBridgeDevice()
+    bridge.mitm_mode = True
+    bridge.passthrough = True
+    bridge.ready_to_control = False  # send_a3 is suppressed while relaying
+    g.ncync_server.get_dev_tcp_pool = AsyncMock(return_value=[bridge])
+    g.mqtt_client = MagicMock()
+
+    await broadcast_control_command(
+        target_id=1, sub_id=0, op=0xD0, cmd_=0x0D,
+        payload=struct.pack(">BBBBB", 0x11, 0x02, 0x01, 0x00, 0x00),
+        m_cb=MagicMock(), lp="t:",
+    )
+
+    assert bridge.written, "passthrough dropped the command instead of sending it"
+    assert b"\x11\x02\x01\x00\x00" in bridge.written[0]
+
+
+async def test_capture_mode_still_stays_off_the_wire():
+    """The per-device MITM switch must keep its original behaviour: the cloud
+    is driving, and anything we inject pollutes the capture."""
+    g = GlobalObject()
+    g.ncync_server = MagicMock()
+    bridge = _FakeBridgeDevice()
+    bridge.mitm_mode = True
+    bridge.passthrough = False
+    g.ncync_server.get_dev_tcp_pool = AsyncMock(return_value=[bridge])
+    g.mqtt_client = MagicMock()
+
+    await broadcast_control_command(
+        target_id=1, sub_id=0, op=0xD0, cmd_=0x0D,
+        payload=struct.pack(">BBBBB", 0x11, 0x02, 0x01, 0x00, 0x00),
+        m_cb=MagicMock(), lp="t:",
+    )
+
+    assert bridge.written == [], "capture mode wrote to a session it should observe"
+
+
+def test_observe_only_is_the_only_thing_that_silences_us():
+    """Pinning the truth table, because the two flags are easy to confuse."""
+    session = _fake_session(node=None)
+    for mitm, passthrough, expected in (
+        (False, False, False),  # ordinary session
+        (True, False, True),    # per-device capture switch
+        (True, True, False),    # cloud passthrough
+        (False, True, False),   # not reachable, but must not silence us
+    ):
+        session.mitm_mode, session.passthrough = mitm, passthrough
+        assert session.observe_only is expected, (mitm, passthrough)
