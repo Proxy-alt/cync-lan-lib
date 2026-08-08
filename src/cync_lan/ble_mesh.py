@@ -162,6 +162,38 @@ OP_SET_TEMP_RGB = OP_SET_TEMP_SOL
 # encrypted mesh-command path as everything else - no cleartext ever goes on
 # air. `SetWifiCommand.java`'s opcode array is {0xF6, 0x11, 0x02, 0x02}: the
 # opcode, the vendor id, and a sub-discriminator that rides in the payload.
+# The 0x8E family, on the wire it was always meant for.
+#
+# Over TCP these ride a "mesh relay" envelope (op 0x8E, repeat_op_code=False)
+# whose whole job is to get the Wi-Fi device to forward them into this mesh.
+# Here we are already on the mesh, so the envelope disappears and what is
+# left is the command itself - which is why the decompiled app's opcode
+# arrays read as BLE packets directly.
+#
+# `SetStatusIndicatorSettingsCommand`'s array is {0xF7, 0x11, 0x02, 0x06}:
+# opcode, vendor id low, vendor id high, sub-command. Those are exactly
+# build_command's bytes 7, 8, 9 and the first data byte. devices.py builds
+# the same four bytes as the head of a TCP payload; the difference is only
+# where the vendor id sits.
+OP_VENDOR_SETTINGS = 0xF7
+
+# Sub-commands within 0xF7, taken from the payloads devices.py sends.
+SUB_INDICATOR_LED = 0x06
+SUB_MULTICOLOR = 0x4E
+SUB_DIMMER_LED_MODE = 0x62
+SUB_DIMMER_LED_LEVEL = 0x63
+
+# The dimmer LED level bar is a preview/save pair, not one write - the
+# device shows the level while you drag and keeps it when you let go.
+DIMMER_LED_ACTION_PREVIEW = 1
+DIMMER_LED_ACTION_SAVE = 2
+
+# How the level bar behaves. devices.py refuses anything else and so does
+# this - a mesh command is fire-and-forget with no ack, so an out-of-range
+# mode is invisible unless it is refused before it goes out.
+DIMMER_LED_BRIEFLY_DISPLAY = 1
+DIMMER_LED_ALWAYS_ON = 2
+
 OP_SET_WIFI = 0xF6
 _WIFI_SUBCODE = 0x02
 _WIFI_CHUNK_LEN = 8
@@ -790,4 +822,118 @@ class BleMeshSession:
             target,
             OP_SET_LEVEL,
             bytes([0x01, 0xFF, 0xFE, red & 0xFF, green & 0xFF, blue & 0xFF]),
+        )
+
+    # ------------------------------------------------------------------
+    # The 0x8E family, ported from devices.py
+    #
+    # NOT CONFIRMED OVER BLE. Every payload below is byte-for-byte what
+    # devices.py puts inside its 0x8E relay envelope, and
+    # tests/test_ble_tcp_parity.py asserts that mechanically rather than by
+    # eye - so these are as well-founded as anything can be without
+    # hardware, and no better. The structural argument is strong: the relay
+    # envelope exists to get these onto this mesh, so removing it is the
+    # whole translation. That is a reason to believe, not evidence.
+    #
+    # `set_indicator_led` is the one whose TCP form was confirmed on real
+    # hardware, which is why its payload shape is trustworthy even though
+    # this transport for it is not.
+    # ------------------------------------------------------------------
+
+    async def set_indicator_led(
+        self,
+        target: int,
+        mode: int,
+        color: int,
+        brightness: int,
+        wifi_disconnect_blink: bool = False,
+    ) -> None:
+        """The small status ring, not the device's main light output.
+
+        mode: 0=always on, 1=always off, 2=normal. color: 0=white, 1=red,
+        2=green, 3=blue - a four-value enum, not full RGB.
+        """
+        if mode not in (0, 1, 2):
+            raise BleMeshError(f"indicator mode must be 0, 1 or 2, got {mode}")
+        if color not in (0, 1, 2, 3):
+            raise BleMeshError(f"indicator color must be 0-3, got {color}")
+        if not 1 <= brightness <= 100:
+            raise BleMeshError(f"indicator brightness must be 1-100, got {brightness}")
+        await self.send(
+            target,
+            OP_VENDOR_SETTINGS,
+            bytes(
+                [
+                    SUB_INDICATOR_LED,
+                    (mode << 4) | color,
+                    brightness,
+                    1 if wifi_disconnect_blink else 0,
+                ]
+            ),
+        )
+
+    async def set_dimmer_led_mode(self, target: int, mode: int) -> None:
+        """Which way a dimmer switch's level bar behaves.
+
+        1 briefly displays the level on change, 2 keeps it lit.
+        """
+        if mode not in (DIMMER_LED_BRIEFLY_DISPLAY, DIMMER_LED_ALWAYS_ON):
+            raise BleMeshError(
+                f"dimmer led mode must be {DIMMER_LED_BRIEFLY_DISPLAY} "
+                f"(briefly display) or {DIMMER_LED_ALWAYS_ON} (always on), "
+                f"got {mode}"
+            )
+        await self.send(
+            target, OP_VENDOR_SETTINGS, bytes([SUB_DIMMER_LED_MODE, mode & 0xFF])
+        )
+
+    async def set_dimmer_led_brightness(self, target: int, level: int) -> None:
+        """Preview then save, exactly as devices.py sends it.
+
+        Two packets rather than one: the device shows the level while the
+        slider moves and keeps it when the save arrives. Sending only the
+        preview leaves the setting untouched once the device times out.
+        """
+        if not 0 <= level <= 100:
+            raise BleMeshError(f"level must be 0-100, got {level}")
+        await self.send(
+            target,
+            OP_VENDOR_SETTINGS,
+            bytes([SUB_DIMMER_LED_LEVEL, DIMMER_LED_ACTION_PREVIEW, 0xF0, level]),
+        )
+        await self.send(
+            target,
+            OP_VENDOR_SETTINGS,
+            bytes([SUB_DIMMER_LED_LEVEL, DIMMER_LED_ACTION_SAVE]),
+        )
+
+    async def set_multicolor_gradient_mode(self, target: int, enabled: bool) -> None:
+        """Blend between segments, rather than stepping."""
+        await self.send(
+            target,
+            OP_VENDOR_SETTINGS,
+            bytes([SUB_MULTICOLOR, 0x00, 1 if enabled else 0]),
+        )
+
+    async def set_multicolor_segment_count(self, target: int, count: int) -> None:
+        """How many independently addressable segments the strip presents."""
+        await self.send(
+            target, OP_VENDOR_SETTINGS, bytes([SUB_MULTICOLOR, 0xFF, count & 0xFF])
+        )
+
+    async def set_light_effect(
+        self, target: int, mode_code: int, index: int, nonce: int
+    ) -> None:
+        """A factory effect preset - Static, LightShow, MusicShow, Reveal,
+        MultiColor - selected by mode code and index.
+
+        Not part of the 0x8E family: this one rides 0xE2 with the vendor id
+        leading its payload on TCP, so the opcode is the outer op rather
+        than the payload's first byte. Same decomposition, different place
+        to cut.
+        """
+        await self.send(
+            target,
+            OP_SET_TEMP_SOL,  # 0xE2, shared with the sol-lamp CCT command
+            bytes([0x07, mode_code & 0xFF, index & 0xFF, nonce & 0xFF]),
         )

@@ -7,6 +7,46 @@ Assistant `cync_lan` custom_component's own version scheme - all three are
 versioned and released separately. See the root `README.md`/`RELEASING.md`
 on `feature/ha-custom-component` for how the three artifacts relate.
 
+### 0.15.0
+
+**Six commands ported from the TCP path onto the BLE mesh**, where they were
+always headed.
+
+Over TCP these ride a 0x8E "mesh relay" envelope whose entire job is to get
+a Wi-Fi device to forward them into the Bluetooth mesh. Here we are already
+on the mesh, so the envelope goes and what is left is the command. That is
+why the decompiled app's opcode arrays read as BLE packets directly:
+`SetStatusIndicatorSettingsCommand`'s `{0xF7, 0x11, 0x02, 0x06}` is opcode,
+vendor id, sub-command - `build_command`'s bytes 7, 8-9 and 10.
+
+`set_indicator_led`, `set_dimmer_led_mode`, `set_dimmer_led_brightness`
+(preview and save, both packets), `set_multicolor_gradient_mode`,
+`set_multicolor_segment_count`, and `set_light_effect` - the last riding
+0xE2 with its opcode outside the payload, so the cut falls one byte further
+along.
+
+**None of these is confirmed over BLE and the docstrings say so.** What is
+established is the strongest thing available without a radio:
+`tests/test_ble_tcp_parity.py` asserts mechanically, for every command, that
+the bytes BLE puts in its packet are exactly the bytes TCP puts in its
+payload. That is a reason to believe, not evidence - and worth stating
+plainly, because these same four bytes were once misread as an outer op plus
+a payload and shipped a command that did nothing at all on real hardware.
+
+The parity test earned its place immediately: it caught that the BLE
+`set_dimmer_led_mode` accepted any mode while the TCP one refuses anything
+but 1 or 2. A mesh command is fire-and-forget with no ack, so an
+out-of-range value is invisible unless it is refused before it goes out.
+
+**Not ported, deliberately.** The hub family (`execute_scene`, `set_time`,
+the `query_*` commands) is addressed to a Wi-Fi device rather than a mesh
+address, so there is no mesh command underneath to send. The motion-sensor
+settings and schedule, `set_multicolor_segments` and the group commands are
+portable in principle and not done here - variable-length payloads and group
+addressing need their own care. And no Home Assistant entities are exposed
+for any of this: a UI for an unconfirmed command is how a plausible-looking
+wrong opcode reaches users.
+
 ### 0.14.1
 
 `TcpTransport` omits `sub_id` rather than passing it as `None` when there is
