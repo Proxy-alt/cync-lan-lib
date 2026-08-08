@@ -7,6 +7,18 @@ Assistant `cync_lan` custom_component's own version scheme - all three are
 versioned and released separately. See the root `README.md`/`RELEASING.md`
 on `feature/ha-custom-component` for how the three artifacts relate.
 
+### 0.14.1
+
+`TcpTransport` omits `sub_id` rather than passing it as `None` when there is
+no sub-device. `set_power(1, None)` and `set_power(1)` reach the same wire
+but are not the same call to anything mocking the device, and three of the
+integration's own tests failed on exactly that difference when it was first
+put behind the facade. A facade that silently rewrites its consumers' call
+signatures makes work for them for no behavioural gain.
+
+Found by porting the Home Assistant light platform onto it, which is the
+only way this kind of thing shows up.
+
 ### 0.14.0
 
 **`transport.py`: one command surface, whichever wire it goes out on.**

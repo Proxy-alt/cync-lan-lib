@@ -71,6 +71,12 @@ class TcpTransport:
     def __init__(self, device: Any, sub_id: Optional[int] = None) -> None:
         self._device = device
         self._sub_id = sub_id
+        # Omitted rather than passed as None when there is no sub-device.
+        # `set_power(1, None)` and `set_power(1)` reach the same wire, but
+        # they are not the same call to anything mocking the device - and a
+        # facade that silently rewrites every consumer's call signature makes
+        # work for them for no behavioural gain.
+        self._extra = () if sub_id is None else (sub_id,)
 
     @property
     def features(self) -> LightFeatures:
@@ -87,16 +93,16 @@ class TcpTransport:
         )
 
     async def set_power(self, on: bool) -> None:
-        await self._device.set_power(1 if on else 0, self._sub_id)
+        await self._device.set_power(1 if on else 0, *self._extra)
 
     async def set_brightness(self, percent: int) -> None:
-        await self._device.set_brightness(percent, self._sub_id)
+        await self._device.set_brightness(percent, *self._extra)
 
     async def set_temperature(self, cync_temp: int) -> None:
-        await self._device.set_temperature(cync_temp, self._sub_id)
+        await self._device.set_temperature(cync_temp, *self._extra)
 
     async def set_rgb(self, red: int, green: int, blue: int) -> None:
-        await self._device.set_rgb(red, green, blue, self._sub_id)
+        await self._device.set_rgb(red, green, blue, *self._extra)
 
 
 class BleTransport:

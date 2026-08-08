@@ -196,3 +196,30 @@ def test_transport_needs_no_home_assistant():
         elif isinstance(node, ast.ImportFrom) and node.module:
             imported.append(node.module)
     assert not [m for m in imported if m.split(".")[0] == "homeassistant"]
+
+
+async def test_no_sub_id_means_the_argument_is_not_passed_at_all():
+    """`set_power(1, None)` and `set_power(1)` reach the same wire but are
+    not the same call to anything mocking the device. A facade that rewrites
+    every consumer's call signature makes work for them for nothing - three
+    shipped tests failed on exactly that difference."""
+    calls = []
+
+    class _Strict:
+        metadata = device_type_map[55]
+        is_dimmable = supports_temperature = supports_rgb = True
+
+        async def set_power(self, state, sub_id=None):
+            calls.append(("power",) + ((state,) if sub_id is None else (state, sub_id)))
+
+        async def set_rgb(self, red, green, blue, sub_id=None):
+            calls.append(("rgb", red, green, blue) + ((sub_id,) if sub_id else ()))
+
+    device = _Strict()
+    await TcpTransport(device).set_power(True)
+    await TcpTransport(device).set_rgb(10, 20, 30)
+    assert calls == [("power", 1), ("rgb", 10, 20, 30)]
+
+    calls.clear()
+    await TcpTransport(device, sub_id=2).set_power(True)
+    assert calls == [("power", 1, 2)]
