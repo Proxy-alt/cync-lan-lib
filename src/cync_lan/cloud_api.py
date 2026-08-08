@@ -18,20 +18,12 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from pydantic import ValidationError
 
+from cync_lan.config import CyncConfig
 from cync_lan.const import (
     CYNC_ACCOUNT_LANGUAGE,
-    CYNC_ACCOUNT_PASSWORD,
-    CYNC_ACCOUNT_USERNAME,
     CYNC_API_BASE,
-    CYNC_CLOUD_AUTH_PATH,
-    CYNC_CONFIG_DIR,
-    CYNC_CONFIG_FILE_PATH,
     CYNC_CORP_ID,
-    CYNC_EXPORT_SOURCE,
-    CYNC_FIRMWARE_CAPTURE_DIR,
     CYNC_LOG_NAME,
-    CYNC_OVERWRITE_CONFIG_FILE,
-    CYNC_SECRET_KEY,
 )
 from cync_lan.structs import ComputedTokenStruct, EntityState, GlobalObject
 
@@ -119,7 +111,7 @@ PASSWORD_MAX_LENGTH = 16
 class CyncCloudAPI:
     api_timeout: int = 8
     lp: str = "CyncCloudAPI"
-    auth_cache_file = CYNC_CLOUD_AUTH_PATH
+    auth_cache_file: str
     token_cache: ComputedTokenStruct
     http_session: aiohttp.ClientSession = None
     # inject-websession: True once a caller-owned session has been injected
@@ -135,12 +127,25 @@ class CyncCloudAPI:
     last_firmware_capture: Optional[dict] = None
     _instance: "CyncCloudAPI" = None
 
-    def __new__(cls, *args, **kwargs):
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-        return cls._instance
+    def __init__(self, config: Optional[CyncConfig] = None, **kwargs: Any) -> None:
+        """An ordinary object. Constructing one gets you a new one.
 
-    def __init__(self, **kwargs: Any) -> None:
+        It used to be a singleton via `__new__`, which made
+        `CyncCloudAPI()` anywhere in the process hand back the first
+        instance, token cache and all. That is invisible and fine with one
+        consumer, and actively harmful with two: a second Home Assistant
+        integration calling `CyncCloudAPI()` received cync-lan's live
+        instance, picked up its *expired* token, and surfaced the resulting
+        refresh failure to its user as "could not reach the Cync cloud
+        API" - a fault in neither the cloud nor the caller. Sharing is now
+        something you ask for by name, see `shared()`.
+
+        `config` carries the settings that must be able to differ between
+        consumers; omitted, it reads the environment *now* rather than
+        inheriting whatever `const.py` froze when it was first imported.
+        """
+        self.config = config if config is not None else CyncConfig.from_env()
+        self.auth_cache_file = self.config.cloud_auth_path
         self.api_timeout = kwargs.get("api_timeout", 8)
         self.lp = kwargs.get("lp", self.lp)
         session = kwargs.get("session")
@@ -148,14 +153,39 @@ class CyncCloudAPI:
             # Accept a caller-owned aiohttp session (e.g. Home Assistant's
             # shared session via
             # homeassistant.helpers.aiohttp_client.async_get_clientsession)
-            # instead of always creating our own. This is a singleton
-            # (__new__ above), so __init__ re-runs on every CyncCloudAPI()
-            # call - only overwrite http_session when a session is actually
-            # passed, so bare CyncCloudAPI() calls elsewhere in the codebase
-            # keep using whatever session (injected or self-created) is
-            # already set, rather than clobbering it back to None.
+            # instead of always creating our own.
             self.http_session = session
             self._session_injected = True
+
+    @classmethod
+    def shared(
+        cls, config: Optional[CyncConfig] = None, **kwargs: Any
+    ) -> "CyncCloudAPI":
+        """The process-wide instance, created on first call.
+
+        This is the old implicit `CyncCloudAPI()` behaviour, kept because
+        some of it is genuinely wanted - `last_firmware_capture` is written
+        by the server's periodic check and read by a Home Assistant sensor
+        that has no other route to it, and a single token cache avoids two
+        refreshes racing for the same file.
+
+        It is a classmethod so that wanting it is written down at the call
+        site. A consumer that needs its own account, its own config
+        directory, or simply not to be entangled with whatever else is in
+        the interpreter should construct the class directly.
+
+        A `session` passed here is applied to the existing instance, since
+        the first caller may have created it before Home Assistant's shared
+        session was available.
+        """
+        if cls._instance is None:
+            cls._instance = cls(config, **kwargs)
+            return cls._instance
+        session = kwargs.get("session")
+        if session is not None:
+            cls._instance.http_session = session
+            cls._instance._session_injected = True
+        return cls._instance
 
     async def close(self):
         """
@@ -241,15 +271,15 @@ class CyncCloudAPI:
         lp = f"{self.lp}:request_otp:"
         await self._check_session()
         req_otp_url = f"{CYNC_API_BASE}two_factor/email/verifycode"
-        if CYNC_EXPORT_SOURCE is None:
-            if not CYNC_ACCOUNT_USERNAME or not CYNC_ACCOUNT_PASSWORD:
+        if self.config.export_source is None:
+            if not self.config.username or not self.config.password:
                 logger.error(
                     f"{lp} Cync account username or password not set, cannot request OTP!"
                 )
                 return False
             auth_data = {
                 "corp_id": CYNC_CORP_ID,
-                "email": CYNC_ACCOUNT_USERNAME,
+                "email": self.config.username,
                 "local_lang": CYNC_ACCOUNT_LANGUAGE,
             }
             sesh = self.http_session
@@ -309,7 +339,7 @@ class CyncCloudAPI:
         # not subscriptable. request_otp has guarded this since it was
         # written; send_otp never did, and only started needing to when the
         # slice arrived.
-        if not CYNC_ACCOUNT_USERNAME or not CYNC_ACCOUNT_PASSWORD:
+        if not self.config.username or not self.config.password:
             logger.error(
                 f"{lp} Cync account username or password not set, cannot send OTP!"
             )
@@ -318,7 +348,7 @@ class CyncCloudAPI:
         api_auth_url = f"{CYNC_API_BASE}user_auth/two_factor"
         auth_data = {
             "corp_id": CYNC_CORP_ID,
-            "email": CYNC_ACCOUNT_USERNAME,
+            "email": self.config.username,
             # Cync's signup form caps passwords at 16 characters, so an
             # account created with a longer one only ever had the first 16
             # stored. Sending the whole thing compares against something the
@@ -336,7 +366,7 @@ class CyncCloudAPI:
             #
             # A login shim, not validation: if this package ever grows a
             # registration path, the limit belongs at the input instead.
-            "password": CYNC_ACCOUNT_PASSWORD[:PASSWORD_MAX_LENGTH],
+            "password": self.config.password[:PASSWORD_MAX_LENGTH],
             "two_factor": otp_code,
             "resource": "".join(random.choices(string.ascii_lowercase, k=16)),
         }
@@ -623,7 +653,7 @@ class CyncCloudAPI:
         url = task.get("target_version_url")
         if not url:
             return None
-        directory = Path(dest_dir or CYNC_FIRMWARE_CAPTURE_DIR or ".")
+        directory = Path(dest_dir or self.config.firmware_capture_dir or ".")
         directory.mkdir(parents=True, exist_ok=True)
 
         version = str(task.get("target_version", "unknown"))
@@ -703,20 +733,20 @@ class CyncCloudAPI:
 
     async def export_config_file(self) -> bool:
         """Get Cync devices from the cloud"""
-        if CYNC_EXPORT_SOURCE is not None:
+        if self.config.export_source is not None:
             logger.warning(
-                f"{self.lp} The source for export has been configured as a file: {CYNC_EXPORT_SOURCE} "
+                f"{self.lp} The source for export has been configured as a file: {self.config.export_source} "
                 f"skipping cloud export and using the provided file instead..."
             )
-            src_file = Path(CYNC_EXPORT_SOURCE)
+            src_file = Path(self.config.export_source)
             if not src_file.exists():
                 logger.error(
-                    f"{self.lp} The provided export source file does not exist: {CYNC_EXPORT_SOURCE}"
+                    f"{self.lp} The provided export source file does not exist: {self.config.export_source}"
                 )
                 return False
             elif not src_file.is_file():
                 logger.error(
-                    f"{self.lp} The provided export source path is not a file: {CYNC_EXPORT_SOURCE}"
+                    f"{self.lp} The provided export source path is not a file: {self.config.export_source}"
                 )
                 return False
             else:
@@ -725,21 +755,21 @@ class CyncCloudAPI:
                         exported_data = yaml.safe_load(f)
                 except Exception as file_exc:
                     logger.error(
-                        f"{self.lp} Failed to read export source file: {CYNC_EXPORT_SOURCE} -> {file_exc}"
+                        f"{self.lp} Failed to read export source file: {self.config.export_source} -> {file_exc}"
                     )
                     return False
                 else:
                     logger.debug(
-                        f"{self.lp} Successfully read export source file: {CYNC_EXPORT_SOURCE}"
+                        f"{self.lp} Successfully read export source file: {self.config.export_source}"
                     )
         else:
             # use the cloud
             exported_data = await self.request_device_data()
         cync_lan_cfg = await self._parse_raw_export(exported_data)
         # write config to file in YAML format
-        base_cfg_path = Path(CYNC_CONFIG_FILE_PATH)
+        base_cfg_path = Path(self.config.config_file_path)
         raw_cfg_file_out = base_cfg_path
-        if CYNC_OVERWRITE_CONFIG_FILE is False:
+        if self.config.overwrite_config_file is False:
             counter = 1
             while raw_cfg_file_out.exists():
                 raw_cfg_file_out = base_cfg_path.with_name(
@@ -756,7 +786,7 @@ class CyncCloudAPI:
             )
         except Exception as file_exc:
             logger.error(
-                f"{self.lp} Failed to write cync-lan config to file: {CYNC_CONFIG_FILE_PATH} -> {file_exc}"
+                f"{self.lp} Failed to write cync-lan config to file: {self.config.config_file_path} -> {file_exc}"
             )
             return False
         else:
@@ -767,7 +797,7 @@ class CyncCloudAPI:
         lp = f"{self.lp}:parse export:"
         new_cfg = {}
         # What we get from the Cync cloud API
-        base_file_path = Path(CYNC_CONFIG_DIR) / "raw_mesh.cync"
+        base_file_path = Path(self.config.config_dir) / "raw_mesh.cync"
         raw_file_out = base_file_path
         # strip out empty configs (IDK why, I have a bunch with access_code 77777 that are empty)
         for raw_home in exported_home_data:
@@ -988,8 +1018,8 @@ class CyncCloudAPI:
 
         # END OF HOME PARSING LOOP
         # write raw exported config to file for debugging, only if export source is None
-        if CYNC_EXPORT_SOURCE is None:
-            if CYNC_OVERWRITE_CONFIG_FILE is False:
+        if self.config.export_source is None:
+            if self.config.overwrite_config_file is False:
                 # basic numbered suffix logic to prevent overwriting existing files
                 counter = 1
                 while raw_file_out.exists():
@@ -1013,14 +1043,16 @@ class CyncCloudAPI:
 
     def _get_fernet_cipher(self) -> Fernet:
         """
-        Derives a secure, 32-byte url-safe base64-encoded key from the CYNC_SECRET_KEY
+        Derives a secure, 32-byte url-safe base64-encoded key from the self.config.secret_key
         passphrase using PBKDF2 and initializes a fernet cipher suite.
         """
-        if not CYNC_SECRET_KEY:
-            logger.critical("CYNC_SECRET_KEY is not set! You must configure this!")
+        if not self.config.secret_key:
+            logger.critical(
+                "self.config.secret_key is not set! You must configure this!"
+            )
             signal.raise_signal(signal.SIGINT)
         else:
-            passphrase = CYNC_SECRET_KEY.encode()
+            passphrase = self.config.secret_key.encode()
         # A static salt is used because the target file is local and we need to derive
         # the exact same key across restarts without storing it on disk.
         salt = b"cync_lan_static_salt_for_local_storage"

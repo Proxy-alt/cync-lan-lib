@@ -23,6 +23,7 @@ from cync_lan.cloud_api import (
     _decode_sensor_schedule_slot,
     _decode_sensor_schedules,
 )
+from cync_lan.config import CyncConfig
 
 # Real (slightly malformed - see docs/cync_automations.md's data-quality
 # caveat) example from a live account: duplicate id=1, no id=0.
@@ -540,20 +541,31 @@ async def test_capture_firmware_has_no_way_to_reach_a_device():
 
 
 @pytest.fixture
-def _credentials(monkeypatch):
-    """cloud_api binds these at import, so patch the module's own names."""
-    monkeypatch.setattr(cloud_api, "CYNC_ACCOUNT_USERNAME", "user@example.com")
-    monkeypatch.setattr(cloud_api, "CYNC_ACCOUNT_PASSWORD", "correct horse battery")
+def _credentials():
+    """Credentials as an argument rather than a patched module global.
+
+    These were `monkeypatch.setattr(cloud_api, "CYNC_ACCOUNT_USERNAME", ...)`
+    for as long as cloud_api bound them at import. Passing a config is not
+    merely tidier - patching the module could only ever describe one account
+    per process, which is the same limitation that made a second Home
+    Assistant integration silently authenticate as the first one's user.
+    """
+    return CyncConfig(
+        config_dir="/nonexistent/cync-test",
+        username="user@example.com",
+        password="correct horse battery",
+    )
 
 
-async def _sent_otp(code, monkeypatch):
+async def _sent_otp(code, monkeypatch, config):
     """Run send_otp and return what it put in the request body.
 
-    Stubs go through monkeypatch rather than plain assignment because
-    CyncCloudAPI is a process-wide singleton - a direct `api._send_tkn_post =
-    ...` outlives the test and every later one gets the stub. Caught exactly
-    that way: these passed alone and broke test_error_paths.py in the full
-    suite.
+    The stubs still go through monkeypatch, but no longer because they would
+    otherwise leak: instances are ordinary objects now, so a plain assignment
+    would die with this one. It used to be that `api._send_tkn_post = ...`
+    outlived the test and every later one inherited the stub, since every
+    CyncCloudAPI() was the same object - caught exactly that way, when these
+    passed alone and broke test_error_paths.py in the full suite.
     """
     captured = {}
 
@@ -561,7 +573,7 @@ async def _sent_otp(code, monkeypatch):
         captured.update(data)
         return True
 
-    api = cloud_api.CyncCloudAPI()
+    api = cloud_api.CyncCloudAPI(config)
     monkeypatch.setattr(api, "_check_session", AsyncMock(return_value=None))
     monkeypatch.setattr(api, "_send_tkn_post", _post)
     ok = await api.send_otp(code)
@@ -571,7 +583,7 @@ async def _sent_otp(code, monkeypatch):
 async def test_a_leading_zero_otp_survives_to_the_wire(_credentials, monkeypatch):
     """Reported by @baudneo on PR #1. int("012345") is 12345 - six digits
     become five, and the vendor rejects it with nothing to explain why."""
-    ok, sent = await _sent_otp("012345", monkeypatch)
+    ok, sent = await _sent_otp("012345", monkeypatch, _credentials)
     assert ok is True
     assert sent["two_factor"] == "012345"
 
@@ -582,7 +594,7 @@ async def test_an_all_zero_otp_is_not_mistaken_for_a_missing_one(
     """The nastier form of the same bug: "000000" coerced to 0, hit the
     falsy check, and was reported as "OTP code must be provided" for a code
     the user had typed correctly."""
-    ok, sent = await _sent_otp("000000", monkeypatch)
+    ok, sent = await _sent_otp("000000", monkeypatch, _credentials)
     assert ok is True
     assert sent["two_factor"] == "000000"
 
@@ -590,7 +602,7 @@ async def test_an_all_zero_otp_is_not_mistaken_for_a_missing_one(
 async def test_integer_codes_are_still_accepted_and_padded(_credentials, monkeypatch):
     """Callers have been passing ints. One that never had a leading zero is
     unharmed; one that already lost it cannot be recovered here."""
-    ok, sent = await _sent_otp(123456, monkeypatch)
+    ok, sent = await _sent_otp(123456, monkeypatch, _credentials)
     assert ok is True
     assert sent["two_factor"] == "123456"
 
@@ -599,13 +611,13 @@ async def test_the_password_is_truncated_to_sixteen_characters(
     _credentials, monkeypatch
 ):
     """PR #1: the vendor started rejecting longer passwords with a 400."""
-    _, sent = await _sent_otp("123456", monkeypatch)
+    _, sent = await _sent_otp("123456", monkeypatch, _credentials)
     assert sent["password"] == "correct horse ba"
     assert len(sent["password"]) == 16
 
 
 async def test_a_non_numeric_code_is_refused(_credentials, monkeypatch):
-    api = cloud_api.CyncCloudAPI()
+    api = cloud_api.CyncCloudAPI(_credentials)
     monkeypatch.setattr(api, "_check_session", AsyncMock(return_value=None))
     assert await api.send_otp("12ab56") is False
     assert await api.send_otp("   ") is False
@@ -615,9 +627,7 @@ async def test_missing_credentials_are_reported_not_raised(monkeypatch):
     """The truncation subscripts the password, and it defaults to None, so an
     unconfigured account raised TypeError instead of saying what was wrong.
     request_otp has always guarded this; send_otp only started needing to."""
-    monkeypatch.setattr(cloud_api, "CYNC_ACCOUNT_USERNAME", None)
-    monkeypatch.setattr(cloud_api, "CYNC_ACCOUNT_PASSWORD", None)
-    api = cloud_api.CyncCloudAPI()
+    api = cloud_api.CyncCloudAPI(CyncConfig(config_dir="/nonexistent/cync-test"))
     monkeypatch.setattr(api, "_check_session", AsyncMock(return_value=None))
     assert await api.send_otp("123456") is False
 
@@ -629,10 +639,14 @@ async def test_a_password_is_truncated_but_never_trimmed(_credentials, monkeypat
     guesses can be right, and silently picking the other one locks the user
     out with a "password error" they cannot act on."""
     padded = "hunter2" + " " * 9  # exactly 16, the last nine of them spaces
-    monkeypatch.setattr(cloud_api, "CYNC_ACCOUNT_PASSWORD", padded)
-    _, sent = await _sent_otp("123456", monkeypatch)
+    _, sent = await _sent_otp(
+        "123456", monkeypatch, _credentials.with_credentials("u@e.com", padded)
+    )
     assert sent["password"] == padded
 
-    monkeypatch.setattr(cloud_api, "CYNC_ACCOUNT_PASSWORD", "MyPasswordIsCool ")
-    _, sent = await _sent_otp("123456", monkeypatch)
+    _, sent = await _sent_otp(
+        "123456",
+        monkeypatch,
+        _credentials.with_credentials("u@e.com", "MyPasswordIsCool "),
+    )
     assert sent["password"] == "MyPasswordIsCool", "only the 17th character goes"

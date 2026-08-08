@@ -7,6 +7,54 @@ Assistant `cync_lan` custom_component's own version scheme - all three are
 versioned and released separately. See the root `README.md`/`RELEASING.md`
 on `feature/ha-custom-component` for how the three artifacts relate.
 
+### 0.11.0
+
+**`CyncCloudAPI` is no longer a singleton, and settings can be passed in
+rather than read from the environment at import.** Both existed to serve one
+process with one account - the add-on - and both break as soon as something
+else shares the interpreter.
+
+Home Assistant is that something else. `cync_lan` and `cync_ble` can be
+installed side by side, and on a real install with both, three things went
+wrong silently:
+
+- `CyncCloudAPI()` returned the *other* integration's live client, token
+  cache and all. `cync_ble` picked up cync-lan's expired token, tried to
+  refresh it, and reported the failure to its user as "could not reach the
+  Cync cloud API" - a fault in neither the cloud nor the caller.
+- `CYNC_CONFIG_DIR` had no effect once the first integration had imported
+  `const`, so writes landed in one integration's directory while reads
+  looked in the other's.
+- `CYNC_ACCOUNT_USERNAME`/`_PASSWORD` had no effect either, so credentials
+  typed into the second wizard were ignored and the first account's used.
+  The worst of the three, because a login that succeeds as the wrong user
+  looks like it worked.
+
+`cync_ble` worked around all of it by writing its own 243-line cloud client
+purely to avoid this module. That client can now go.
+
+Two changes. `CyncCloudAPI` is an ordinary class: constructing one gets you
+one. Process-wide sharing still exists and is still wanted - the firmware
+sensor reads what the server's periodic check wrote - but it is now
+`CyncCloudAPI.shared()`, asked for by name at the call site. And a new
+`cync_lan.config.CyncConfig` carries the settings that must differ per
+consumer, with `from_env()` reading the environment *when called* instead of
+whenever `const` was first imported.
+
+**`const.py` is unchanged.** Every module-level name is still there, still
+means the same thing, and is still what the add-on and the TCP server use.
+Nothing about the single-consumer path moves.
+
+**Upgrading:** `CyncCloudAPI()` now returns a new instance. If you relied on
+it returning the shared one, call `CyncCloudAPI.shared()`. The add-on
+constructs it once and holds the reference, so it is unaffected; both call
+sites in the Home Assistant integration are updated in 2.11.0.
+
+Worth recording that the tests had been paying for this quietly: they were
+littered with `CyncCloudAPI._instance = None` resets, and the OTP tests
+routed every stub through monkeypatch because a plain assignment on a
+singleton outlived its test. Those workarounds are gone.
+
 ### 0.10.4
 
 **Cloud passthrough went mute again, on reconnect.** Found on a live install
