@@ -12,7 +12,13 @@ import contextlib
 from pathlib import Path
 
 import pytest
-from simulator import FakeCloud, VirtualCyncDevice, build_23_auth, write_self_signed
+from simulator import (
+    FakeCloud,
+    VirtualCyncDevice,
+    build_23_auth,
+    build_packet,
+    write_self_signed,
+)
 
 from cync_lan.server import nCyncServer
 from cync_lan.structs import GlobalObject
@@ -291,6 +297,160 @@ async def test_unreachable_cloud_leaves_the_session_local_only(
             assert session.cloud_writer is None
             assert session.queue_id == b"\x39\x87\xc8\x57"
     finally:
+        await _shutdown(server, task)
+
+
+async def test_a_cloud_that_dies_mid_session_hands_the_acks_back(
+    real_sockets, certs, monkeypatch, tmp_path
+):
+    """The sibling of test_unreachable_cloud_leaves_the_session_local_only,
+    for a cloud that was reachable when the session was accepted and stopped
+    being reachable afterwards.
+
+    Only the first case was covered, and the promise in enable_passthrough's
+    docstring - that being unable to phone home is not a reason to stop
+    controlling lights - held for it alone. Once the relay was up, nothing
+    ever took it down: _cloud_proxy_task breaks out of its loop on EOF
+    without touching mitm_mode, so every ack gate in _dispatch_device_request
+    stayed shut with nobody left to answer. The device would have gone on
+    talking to a server that had stopped replying to anything.
+    """
+    monkeypatch.setattr(
+        "cync_lan.devices.CYNC_MITM_LOG_DIR", str(tmp_path / "mitm"), raising=False
+    )
+    monkeypatch.setenv("CYNC_CLOUD_PASSTHROUGH", "1")
+    monkeypatch.setenv("CYNC_CLOUD_IP", "127.0.0.1")
+
+    cloud = FakeCloud(*certs)
+    await cloud.__aenter__()
+    monkeypatch.setenv("CYNC_CLOUD_PORT", str(cloud.port))
+    server, port, task = await _serve(certs)
+    try:
+        async with VirtualCyncDevice("127.0.0.1", port) as device:
+            await device.send(build_23_auth())
+            assert await cloud.wait_for_bytes(1), "the relay never came up"
+
+            session = server.tcp_connections["127.0.0.1"]
+            assert session.mitm_mode is True
+            assert session.passthrough is True
+
+            # The cloud goes away mid-session: peers closed, listener shut.
+            await cloud.__aexit__()
+            await asyncio.sleep(0.5)  # let the proxy task see EOF
+
+            # 0xC3 is answered with 0xC8 by any session that is not relaying.
+            await device.send(build_packet(0xC3))
+            ack = await device.read_until(0xC8, timeout=3.0)
+
+            assert ack is not None, (
+                "the cloud died and the session kept deferring acks to it - "
+                "nothing answers the device now"
+            )
+            assert session.mitm_mode is False, (
+                "the session still believes it is relaying to a cloud that is gone"
+            )
+            assert session.passthrough is False
+            assert session.observe_only is False
+    finally:
+        with contextlib.suppress(Exception):
+            await cloud.__aexit__()
+        await _shutdown(server, task)
+
+
+async def test_passthrough_comes_back_when_the_cloud_does(
+    real_sockets, certs, monkeypatch, tmp_path
+):
+    """Falling back must not be a one-way door.
+
+    Clearing mitm_mode is what lets it recover: start_tasks() re-consults the
+    option for every session it adds, and only reaches enable_passthrough()
+    when mitm_mode is False. Had the fallback left the flag set to remember
+    it was once relaying, the session would have been stuck local-only for
+    good - trading a permanent no-ack state for a permanent no-relay one.
+    """
+    monkeypatch.setattr(
+        "cync_lan.devices.CYNC_MITM_LOG_DIR", str(tmp_path / "mitm"), raising=False
+    )
+    monkeypatch.setenv("CYNC_CLOUD_PASSTHROUGH", "1")
+    monkeypatch.setenv("CYNC_CLOUD_IP", "127.0.0.1")
+
+    first_cloud = FakeCloud(*certs)
+    await first_cloud.__aenter__()
+    monkeypatch.setenv("CYNC_CLOUD_PORT", str(first_cloud.port))
+    server, port, task = await _serve(certs)
+    try:
+        async with VirtualCyncDevice("127.0.0.1", port) as device:
+            await device.send(build_23_auth())
+            assert await first_cloud.wait_for_bytes(1)
+            await first_cloud.__aexit__()
+            await asyncio.sleep(0.5)
+            assert server.tcp_connections["127.0.0.1"].mitm_mode is False
+
+        # The cloud returns, and the device reconnects to it. A different
+        # port only because these are ephemeral - _cloud_endpoint() reads the
+        # environment per call, which is what makes this expressible at all.
+        async with FakeCloud(*certs) as second_cloud:
+            monkeypatch.setenv("CYNC_CLOUD_PORT", str(second_cloud.port))
+            async with VirtualCyncDevice("127.0.0.1", port) as device:
+                await device.send(build_23_auth())
+                assert await second_cloud.wait_for_bytes(1), (
+                    "the session never relayed again after falling back"
+                )
+                session = server.tcp_connections["127.0.0.1"]
+                assert session.mitm_mode is True
+                assert session.passthrough is True
+    finally:
+        with contextlib.suppress(Exception):
+            await first_cloud.__aexit__()
+        await _shutdown(server, task)
+
+
+async def test_a_capture_session_is_left_alone_when_the_cloud_dies(
+    real_sockets, certs, monkeypatch, tmp_path
+):
+    """The fallback above must not reach the per-device capture switch.
+
+    Capture is an explicit choice to observe one device and stay off its
+    wire, and a capture whose cloud has gone is still not an invitation for
+    us to start answering in its place - that would put our packets in the
+    log the user turned the switch on to collect. `passthrough` is what tells
+    the two apart, which is the second thing that flag has now bought.
+    """
+    monkeypatch.setattr(
+        "cync_lan.devices.CYNC_MITM_LOG_DIR", str(tmp_path / "mitm"), raising=False
+    )
+    # Passthrough off: this session's relay comes from start_mitm(), not the
+    # option, so it must keep mitm_mode when the cloud disappears.
+    monkeypatch.delenv("CYNC_CLOUD_PASSTHROUGH", raising=False)
+    monkeypatch.setenv("CYNC_CLOUD_IP", "127.0.0.1")
+
+    cloud = FakeCloud(*certs)
+    await cloud.__aenter__()
+    monkeypatch.setenv("CYNC_CLOUD_PORT", str(cloud.port))
+    server, port, task = await _serve(certs)
+    try:
+        async with VirtualCyncDevice("127.0.0.1", port) as device:
+            await device.send(build_23_auth())
+            await asyncio.sleep(0.3)
+            session = server.tcp_connections["127.0.0.1"]
+
+            await session.start_proxy()
+            session.mitm_mode = True  # what start_mitm() leaves behind
+            assert session.passthrough is False
+            assert session.observe_only is True
+
+            await cloud.__aexit__()
+            await asyncio.sleep(0.5)
+
+            await session.start_proxy()  # the retry that now fails
+
+            assert session.mitm_mode is True, (
+                "a capture session was quietly turned back into an ordinary one"
+            )
+            assert session.observe_only is True
+    finally:
+        with contextlib.suppress(Exception):
+            await cloud.__aexit__()
         await _shutdown(server, task)
 
 

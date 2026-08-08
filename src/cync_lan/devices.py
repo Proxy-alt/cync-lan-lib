@@ -3458,6 +3458,14 @@ class CyncTCPSession:
         except Exception as e:
             logger.error(f"{lp} Failed to start MITM: {e}")
             await self.stop_proxy()
+            # The other way a passthrough session ends up relaying to
+            # nothing: the reconnect path and the idle-connection watcher
+            # both restart the proxy directly, and a cloud that is still
+            # unreachable leaves mitm_mode set with no relay behind it. On
+            # first setup this is a no-op - enable_passthrough sets the flag
+            # only after start_proxy has succeeded, so there is nothing to
+            # fall back from.
+            await self._fall_back_to_local_control()
 
     async def start_mitm(self) -> None:
         """Connect to Cync Cloud and start proxying."""
@@ -3710,6 +3718,60 @@ class CyncTCPSession:
             logger.error(f"{lp} Error in cloud proxy: {e}")
 
         logger.debug(f"{lp} FINISHED")
+
+        # Reaching here means the relay ended on its own - EOF from the cloud,
+        # or a read error. A deliberate teardown (stop_mitm, close) cancels
+        # this task instead, and the CancelledError above re-raises before it
+        # can get this far, so this cannot fire on a session being shut down.
+        #
+        # Scheduled rather than awaited: the fallback calls stop_proxy(),
+        # which cancels *this* task, and a task that cancels itself mid-await
+        # abandons the rest of its own teardown. By the time the new task
+        # runs, this one is done and stop_proxy's `not .done()` guards skip it.
+        if self.passthrough:
+            asyncio.create_task(
+                self._fall_back_to_local_control(),
+                name=f"passthrough_fallback-{self.ip_address}",
+            )
+
+    async def _fall_back_to_local_control(self) -> None:
+        """Hand the acks back when the cloud we were relaying to has gone.
+
+        `enable_passthrough()` promises that being unable to phone home is
+        not a reason to stop controlling lights, and that held only for a
+        cloud already down when the session was accepted. One that died
+        mid-session left `mitm_mode` set with nothing behind it, and every
+        ack in `_dispatch_device_request` is gated on `not self.mitm_mode` -
+        correct while relaying, because the cloud answers the device's
+        handshake and a second ack from us would be a duplicate, and wrong
+        the moment there is no cloud to answer. Confirmed over a real socket
+        in tests/test_e2e_session.py: kill the cloud, send a 0x43, and the
+        device gets silence.
+
+        Commands still went out (that is what `passthrough` bought in
+        0.10.2), so this was quieter than the 0.9.0 outage - the device was
+        controllable but unacknowledged, which is the kind of half-working
+        that gets blamed on the mesh.
+
+        A capture session is deliberately left alone. There `mitm_mode` is
+        set by `start_mitm()` with `passthrough` False, silence is the
+        point, and answering in the cloud's place would put our own packets
+        in the log the user turned the switch on to collect. Telling the two
+        apart is the second thing the `passthrough` flag has bought.
+        """
+        if not self.passthrough:
+            return
+        lp = f"{self.lp}passthrough:"
+        logger.warning(
+            f"{lp} lost the cloud connection - continuing with local control "
+            "for this session. Acks are ours again until it reconnects."
+        )
+        await self.stop_proxy()
+        self.mitm_mode = False
+        self.passthrough = False
+        # Dropped so a later enable_passthrough() opens a fresh capture log
+        # rather than reusing a handler for a relay that no longer exists.
+        self.mitm_logger = None
 
     def _setup_mitm_logger(self):
         """Initializes a rotating file logger for this specific connection."""

@@ -7,6 +7,50 @@ Assistant `cync_lan` custom_component's own version scheme - all three are
 versioned and released separately. See the root `README.md`/`RELEASING.md`
 on `feature/ha-custom-component` for how the three artifacts relate.
 
+### 0.11.1
+
+**A cloud that died mid-session left the device unacknowledged.** Suspected
+by reading while fixing 0.10.4, then confirmed over a real socket before
+anything was changed - the test failed first, which is the only reason this
+entry is written as fact.
+
+`enable_passthrough()` promises that being unable to phone home is not a
+reason to stop controlling lights. That held for a cloud already down when
+the session was accepted, and only for that. Once a relay was up, nothing
+took it down: `_cloud_proxy_task` breaks out of its loop on EOF without
+touching `mitm_mode`, and every ack in `_dispatch_device_request` is gated on
+`not self.mitm_mode`. Those gates are right while relaying - the cloud
+answers the device's handshake and a second ack from us would be a duplicate
+- and wrong the instant there is no cloud to answer. The session went on
+deferring to something that had gone.
+
+Milder than the outages either side of it, and harder to attribute for that.
+Commands still went out, because `passthrough` had already separated
+"relay" from "stay silent" in 0.10.2; what stopped was every acknowledgement.
+A device that is controllable but never acknowledged is the kind of
+half-working that gets blamed on a weak mesh.
+
+A passthrough session now returns to ordinary local operation when its relay
+ends on its own, from either direction it can end: the proxy task reaching
+EOF, and a failed restart on the reconnect or idle-watcher path. A deliberate
+teardown cancels the task instead, and cancellation re-raises before it can
+reach the fallback, so shutting a session down cannot trigger this.
+
+Two things it deliberately does not do. A per-device capture session is left
+alone - there `mitm_mode` is set by `start_mitm()` with `passthrough` False,
+silence is the entire point, and answering in the cloud's place would put our
+own packets in the log the switch was turned on to collect. And the fallback
+clears `mitm_mode` rather than remembering the session was once relaying,
+which is what lets it recover: `start_tasks()` re-consults the option for
+every session it adds and only reaches `enable_passthrough()` when the flag
+is clear. Remembering would have swapped a permanent no-ack state for a
+permanent no-relay one.
+
+All three properties have their own end-to-end test against a real socket and
+a fake cloud, and the first two are mutation-verified in opposite directions:
+drop the fallback and the mid-session test fails; drop the capture guard and
+the capture test fails.
+
 ### 0.11.0
 
 **`CyncCloudAPI` is no longer a singleton, and settings can be passed in
