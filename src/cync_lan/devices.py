@@ -3525,6 +3525,11 @@ class CyncTCPSession:
         """
         lp = f"{self.lp}passthrough:"
         if self.mitm_mode and self.cloud_writer:
+            # Deliberately does not set `passthrough`. Arriving here with a
+            # live relay we did not start means the per-device capture switch
+            # owns this session, and capture is an explicit per-device choice
+            # that outranks the global option - flipping the flag would end
+            # the silence that is the whole point of it.
             return True
         try:
             self._setup_mitm_logger()
@@ -3638,7 +3643,23 @@ class CyncTCPSession:
 
         self.mitm_bytes_to_cloud = 0
         self.mitm_bytes_from_cloud = 0
-        self.passthrough = False
+        # `passthrough` deliberately survives this. It is not connection state
+        # like the counters and the streams above - it is the reason we are
+        # relaying at all, and it has to live exactly as long as `mitm_mode`
+        # does. Clearing it here left `mitm_mode` True and `passthrough` False,
+        # which is the "capture switch" combination: observe_only became True
+        # and the session stopped writing anything of its own.
+        #
+        # Nothing has to go wrong to reach that. The reconnect path and the
+        # idle-cloud-connection watcher both call stop_proxy() followed by
+        # start_proxy() directly, never enable_passthrough(), so the flag was
+        # cleared and never restored. A session degraded permanently on its
+        # first cloud reconnect and only a Home Assistant restart brought it
+        # back. Measured on a live 46-session install: 21 sessions silently
+        # mute, and because send_command broadcasts over CYNC_CMD_BROADCASTS=2
+        # randomly sampled bridges, ~20% of commands lost every copy. That is
+        # the 0.10.2 bug again, arriving by a route the fix did not cover, and
+        # intermittent enough to read as flaky hardware.
         logger.debug(f"{lp} Proxy closed!")
 
     async def stop_mitm(self) -> None:
@@ -3648,6 +3669,7 @@ class CyncTCPSession:
         # if self.mitm is True or self.cloud_reader or self.cloud_writer:
         await self.stop_proxy()
         self.mitm_mode = False
+        self.passthrough = False
         self.mitm_logger = None
         logger.info(
             f"{self.lp} MITM Mode disabled, forcing disconnect to enable normal operation..."

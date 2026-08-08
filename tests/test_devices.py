@@ -1848,3 +1848,43 @@ def test_observe_only_is_the_only_thing_that_silences_us():
     ):
         session.mitm_mode, session.passthrough = mitm, passthrough
         assert session.observe_only is expected, (mitm, passthrough)
+
+
+async def test_stopping_the_proxy_does_not_turn_a_session_into_a_capture(tmp_path):
+    """The truth table above was right and still let the bug through, because
+    it never asked how a session *arrives* at a combination.
+
+    stop_proxy() cleared `passthrough` while leaving `mitm_mode` set, which is
+    the capture-switch row - so a passthrough session silently became
+    observe-only. The two routes there are ordinary operation, not failure:
+    the reconnect path and the idle-cloud-connection watcher both call
+    stop_proxy() and then start_proxy() directly, never enable_passthrough().
+    """
+    session = _fake_session(node=None)
+    session.mitm_mode = True
+    session.passthrough = True
+
+    await session.stop_proxy()
+
+    assert session.passthrough is True, (
+        "stop_proxy cleared the reason we were relaying; the session is now "
+        "indistinguishable from a per-device capture and will write nothing"
+    )
+    assert session.observe_only is False, (
+        "a passthrough session went mute on a cloud reconnect"
+    )
+
+
+async def test_stop_mitm_clears_both_flags(tmp_path):
+    """The other half of moving the assignment: switching capture off must
+    still leave an ordinary session behind, not a half-set one."""
+    session = _fake_session(node=None)
+    session.mitm_mode = True
+    session.passthrough = True
+    session.close = AsyncMock()
+
+    await session.stop_mitm()
+
+    assert session.mitm_mode is False
+    assert session.passthrough is False
+    assert session.observe_only is False

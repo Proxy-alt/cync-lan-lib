@@ -7,6 +7,37 @@ Assistant `cync_lan` custom_component's own version scheme - all three are
 versioned and released separately. See the root `README.md`/`RELEASING.md`
 on `feature/ha-custom-component` for how the three artifacts relate.
 
+### 0.10.4
+
+**Cloud passthrough went mute again, on reconnect.** Found on a live install
+rather than by a test, which is the point of the entry below it.
+
+0.10.2 split `mitm_mode` into two flags so passthrough could relay *and* keep
+controlling devices, and pinned the result with a truth table: `observe_only`
+is `mitm_mode and not passthrough`. The table was right. What no test asked
+was how a session gets into a combination, and one of the routes was
+`stop_proxy()`, which cleared `passthrough` and left `mitm_mode` set - the
+per-device capture-switch row. A passthrough session that stopped its proxy
+came back indistinguishable from a capture and wrote nothing of its own again.
+
+Nothing has to go wrong to get there. Both the reconnect path and the
+idle-cloud-connection watcher call `stop_proxy()` and then `start_proxy()`
+directly, never `enable_passthrough()`, so the flag was cleared and never
+restored. One cloud reconnect muted a session until Home Assistant restarted.
+
+Measured on a live 46-session install before the fix: 21 sessions silently
+mute, 85 dropped writes in 17 hours. It read as flaky hardware rather than a
+bug because commands survive it - `send_command` broadcasts over
+`CYNC_CMD_BROADCASTS` (2) randomly sampled bridges, so a command is lost only
+when both draws are mute. At 21 of 46 that is about one command in five.
+
+`passthrough` is not connection state like the streams and byte counters
+`stop_proxy()` resets; it is the reason the session is relaying, and it now
+lives exactly as long as `mitm_mode` does, cleared beside it in `stop_mitm()`.
+The new tests cover the lifecycle rather than the truth table: stopping a
+proxy must not turn a passthrough session into a capture, and stopping capture
+must still leave an ordinary session behind.
+
 ### 0.10.3
 
 **An unwritable capture-log directory dropped every device.** Found by the
