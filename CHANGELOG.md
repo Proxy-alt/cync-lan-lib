@@ -7,6 +7,46 @@ Assistant `cync_lan` custom_component's own version scheme - all three are
 versioned and released separately. See the root `README.md`/`RELEASING.md`
 on `feature/ha-custom-component` for how the three artifacts relate.
 
+### 0.12.0
+
+**`classify.py`: one answer to "what is this device", for both integrations.**
+The Home Assistant integrations cannot import each other, so `cync_ble`
+carried a copy of `CyncDevice`'s classification logic - its docstring said so
+- and the copies drifted where nothing could see it.
+
+Checked afterwards against all 157 known types: `is_light` agreed on every
+one, so the carve-out that keeps dimmable switches on the light platform had
+been copied faithfully. `is_dimmable` disagreed on 13. `CyncDevice` required
+the type be classified LIGHT; `cync_ble` went by the capability alone.
+
+The capability reading wins, because the narrow one had quietly made its own
+callers impossible. `is_dimmable and not is_light` appears four times in the
+integration to mean "a dimmer switch" - and since every dimmable switch has
+`is_light` True by that same carve-out, while `is_dimmable` demanded LIGHT,
+**no device type could satisfy it**. Two entity classes behind that condition
+had never been created for anybody. `is_dimmer_switch` is what those callers
+meant, and it matches 11 real types.
+
+`CyncDevice`'s properties keep their per-instance setters and now defer to
+`classify` for the computation, so there is one implementation rather than
+three. Also here: `light_features()`, a transport-free descriptor of what a
+light can do, and `to_ha_brightness`/`from_ha_brightness` for the 0-100 to
+0-255 arithmetic both integrations were doing inline.
+
+**Deliberately no Home Assistant import**, enforced by a test that parses the
+module rather than grepping it. The CLI and the MQTT add-on depend on this
+package too, and importing `homeassistant` here would put HA's release
+cadence in front of all three to save each integration about five lines.
+Each side maps `LightFeatures` to its own vocabulary - which is also what
+lets `cync_ble` advertise less than the hardware claims while colour temp and
+RGB are unconfirmed on that transport.
+
+**Upgrading:** `CyncDevice.is_dimmable` is now True for dimmable switches
+(and for types 96 and 112, which are SENSOR-classified with a stray
+`dimmable=True` in the capability data). If you were using
+`is_dimmable and not is_light` as a dimmer-switch test, it never worked;
+use `is_dimmer_switch`.
+
 ### 0.11.1
 
 **A cloud that died mid-session left the device unacknowledged.** Suspected

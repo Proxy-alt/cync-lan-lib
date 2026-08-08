@@ -13,6 +13,7 @@ from functools import partial
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
+from cync_lan import classify
 from cync_lan.const import (
     CYNC_CLOUD_IP,
     CYNC_CLOUD_PASSTHROUGH,
@@ -1718,7 +1719,7 @@ class CyncDevice:
         These devices require 0xD2 for brightness and 0xE2 (sub-cmd 0x05) for CCT,
         rather than the 0xF0 opcodes used by newer Cync mesh devices.
         """
-        return bool(self.metadata and self.metadata.opcodes.sol_lamp)
+        return classify.is_sol_lamp_info(self.metadata)
 
     @property
     def is_hvac(self) -> bool:
@@ -1801,29 +1802,12 @@ class CyncDevice:
     def is_light(self):
         if self._is_light is not None:
             return self._is_light
-        if self.metadata:
-            if self.metadata.type == DeviceClassification.LIGHT:
-                self._is_light = True
-            elif self.metadata.type == DeviceClassification.SWITCH:
-                # A dimmable switch is dimming a light, not a fan - Cync
-                # sells fan speed control as its own dedicated "Fan
-                # Controller" product (capabilities.fan), so any other
-                # dimmable switch type is safe to assume is a light dimmer.
-                # HA's `switch` domain has no brightness concept at all, so
-                # leaving these routed to switch.py (as a bare
-                # DeviceClassification.SWITCH check would) silently drops
-                # dimming entirely - confirmed via a real user report after
-                # this session's earlier SWITCH reclassification (which was
-                # correct for capability data like color/tunable_white, but
-                # shouldn't have affected which HA platform these route to).
-                caps = self.metadata.capabilities
-                self._is_light = bool(
-                    caps and caps.dimmable and not caps.fan and not caps.plug
-                )
-            else:
-                self._is_light = False
-        else:
-            self._is_light = False
+        # classify.py holds the reasoning, including the dimmable-switch
+        # carve-out and the user report behind it. It lived here and was
+        # copied into cync_ble, where the two had to be kept in step by
+        # hand; is_light survived that (all 157 types agreed), is_dimmable
+        # did not.
+        self._is_light = classify.is_light_info(self.metadata)
         return self._is_light
 
     @is_light.setter
@@ -1839,22 +1823,11 @@ class CyncDevice:
     def is_switch(self) -> bool:
         if self._is_switch is not None:
             return self._is_switch
-        if self.metadata:
-            if self.metadata.type != DeviceClassification.SWITCH:
-                return False
-            # Mirror is_light's dimmable carve-out: a dimmable switch
-            # routes through light.py instead (see is_light above), so it
-            # must not also claim is_switch here - that would create a
-            # second, binary-only entity for the same physical device.
-            # Same reasoning for a fan controller (capabilities.fan) - it
-            # gets its own richer entity on the fan platform (fan.py).
-            # switch.py's own setup filter already excludes
-            # is_fan_controller separately as a defensive check, but
-            # is_switch should mean "plain binary switch, nothing else" on
-            # its own so any other caller can trust it without having to
-            # remember to re-check is_fan_controller too.
-            return not self.is_light and not self.is_fan_controller
-        return False
+        # "Plain binary switch, nothing else" - a dimmable switch routes to
+        # the light platform and a fan controller to the fan platform, so
+        # neither may also claim this one or the same physical device gets
+        # two entities. See classify.is_switch_info.
+        return classify.is_switch_info(self.metadata)
 
     @is_switch.setter
     def is_switch(self, value: bool) -> None:
@@ -1869,11 +1842,7 @@ class CyncDevice:
     def is_plug(self) -> bool:
         if self._is_plug is not None:
             return self._is_plug
-        if self.metadata:
-            if self.metadata.type == DeviceClassification.SWITCH:
-                if self.metadata.capabilities:
-                    return self.metadata.capabilities.plug
-        return False
+        return classify.is_plug_info(self.metadata)
 
     @is_plug.setter
     def is_plug(self, value: bool) -> None:
@@ -1887,11 +1856,7 @@ class CyncDevice:
     def is_fan_controller(self):
         if self._is_fan_controller is not None:
             return self._is_fan_controller
-        if self.metadata:
-            if self.metadata.type == DeviceClassification.SWITCH:
-                if self.metadata.capabilities:
-                    return self.metadata.capabilities.fan
-        return False
+        return classify.is_fan_controller_info(self.metadata)
 
     @is_fan_controller.setter
     def is_fan_controller(self, value: bool) -> None:
@@ -1910,21 +1875,27 @@ class CyncDevice:
 
     @property
     def is_dimmable(self) -> bool:
-        if self.metadata:
-            if self.metadata.type == DeviceClassification.LIGHT:
-                if self.metadata.capabilities:
-                    return self.metadata.capabilities.dimmable
-        return False
+        """Whether the hardware dims - a capability, not a category.
+
+        This used to additionally require the type be classified LIGHT,
+        which made it disagree with cync_ble's copy on 13 of 157 types (all
+        the dimmable switches) and left `is_dimmable and not is_light`
+        unsatisfiable for every device in the map. See
+        classify.is_dimmable_info, and use `is_dimmer_switch` for what that
+        idiom was reaching for.
+        """
+        return classify.is_dimmable_info(self.metadata)
+
+    @property
+    def is_dimmer_switch(self) -> bool:
+        """A switch product that dims, as opposed to a dimmable bulb."""
+        return classify.is_dimmer_switch_info(self.metadata)
 
     @property
     def supports_rgb(self) -> bool:
         if self._supports_rgb is not None:
             return self._supports_rgb
-        if self.metadata:
-            if self.metadata.type == DeviceClassification.LIGHT:
-                if self.metadata.capabilities:
-                    return self.metadata.capabilities.color
-        return False
+        return classify.supports_rgb_info(self.metadata)
 
     @supports_rgb.setter
     def supports_rgb(self, value: bool) -> None:
@@ -1934,11 +1905,7 @@ class CyncDevice:
     def supports_temperature(self) -> bool:
         if self._supports_temperature is not None:
             return self._supports_temperature
-        if self.metadata:
-            if self.metadata.type == DeviceClassification.LIGHT:
-                if self.metadata.capabilities:
-                    return self.metadata.capabilities.tunable_white
-        return False
+        return classify.supports_temperature_info(self.metadata)
 
     @supports_temperature.setter
     def supports_temperature(self, value: bool) -> None:
