@@ -187,3 +187,65 @@ def test_brightness_helpers_clamp_rather_than_raise():
     assert classify.to_ha_brightness(1000) == 255
     assert classify.from_ha_brightness(-1) == 0
     assert classify.from_ha_brightness(9999) == 100
+
+
+# ---------------------------------------------------------------------------
+# Colour temperature: kelvin outside, 0-100 on the wire
+# ---------------------------------------------------------------------------
+
+
+def test_kelvin_converts_into_the_range_the_wire_accepts():
+    """`CyncDevice.set_temperature` refuses anything over 100, so a kelvin
+    value passed straight through is not merely imprecise - it is dropped,
+    with an error logged and no packet sent. That is exactly what the Home
+    Assistant integration did for every colour-temperature change."""
+    features = classify.LightFeatures(color_temp=True, min_kelvin=2000, max_kelvin=7000)
+    for kelvin in range(2000, 7001, 100):
+        cync = classify.kelvin_to_cync(kelvin, features)
+        assert 0 <= cync <= 100, f"{kelvin}K produced {cync}, which the wire rejects"
+
+
+def test_kelvin_round_trips_close_enough_to_be_stable():
+    """A slider that moves on its own when nothing changed is worse than one
+    that is slightly coarse. 0-100 over a 5000K span is 50K per step, so a
+    round trip has to land inside one step."""
+    features = classify.LightFeatures(color_temp=True, min_kelvin=2000, max_kelvin=7000)
+    step = (7000 - 2000) / 100
+    for kelvin in range(2000, 7001, 137):
+        back = classify.cync_to_kelvin(
+            classify.kelvin_to_cync(kelvin, features), features
+        )
+        assert abs(back - kelvin) <= step, f"{kelvin}K -> {back}K"
+
+
+def test_kelvin_clamps_outside_the_declared_range():
+    features = classify.LightFeatures(color_temp=True, min_kelvin=2700, max_kelvin=6500)
+    assert classify.kelvin_to_cync(1000, features) == 0
+    assert classify.kelvin_to_cync(9000, features) == 100
+    assert classify.cync_to_kelvin(-5, features) == 2700
+    assert classify.cync_to_kelvin(500, features) == 6500
+
+
+def test_kelvin_uses_the_documented_defaults_when_a_type_declares_none():
+    """Seven known types carry min_kelvin with no max; four carry both."""
+    assert classify.cync_to_kelvin(0) == classify.DEFAULT_MIN_KELVIN
+    assert classify.cync_to_kelvin(100) == classify.DEFAULT_MAX_KELVIN
+    partial = classify.LightFeatures(color_temp=True, min_kelvin=2700, max_kelvin=None)
+    assert classify.cync_to_kelvin(0, partial) == 2700
+    assert classify.cync_to_kelvin(100, partial) == classify.DEFAULT_MAX_KELVIN
+
+
+def test_nonsense_metadata_does_not_divide_by_zero():
+    """A type whose max is at or below its min must not take the entity down.
+
+    It falls back to the documented defaults rather than propagating the
+    broken range, so the answers stay inside what the wire accepts - the
+    point is that nothing raises and nothing lands outside 0-100.
+    """
+    broken = classify.LightFeatures(color_temp=True, min_kelvin=5000, max_kelvin=5000)
+    for kelvin in (1000, 4000, 6000, 9000):
+        assert 0 <= classify.kelvin_to_cync(kelvin, broken) <= 100
+    for cync in (-5, 0, 50, 100, 500):
+        assert classify.cync_to_kelvin(cync, broken) > 0
+    # and it agrees with the default range, rather than inventing a third one
+    assert classify.kelvin_to_cync(4000, broken) == classify.kelvin_to_cync(4000)

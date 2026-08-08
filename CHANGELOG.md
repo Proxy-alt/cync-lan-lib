@@ -7,6 +7,26 @@ Assistant `cync_lan` custom_component's own version scheme - all three are
 versioned and released separately. See the root `README.md`/`RELEASING.md`
 on `feature/ha-custom-component` for how the three artifacts relate.
 
+### 0.13.0
+
+**Kelvin conversion, because one consumer had it and the other did not.**
+Cync speaks 0-100 on the wire whatever a bulb's real range is, and
+`CyncDevice.set_temperature` refuses anything above 100 outright. The MQTT
+add-on has always converted, with its own `kelvin2cync`/`cync2kelvin`. The
+Home Assistant integration never did - it passed Home Assistant's kelvin
+straight through, so every colour-temperature change was rejected with
+"Invalid temperature! must be 0-100" and no packet was sent. Fixed in
+cync_lan 2.13.0; `kelvin_to_cync` and `cync_to_kelvin` live here so there is
+one implementation for both.
+
+`DEFAULT_MIN_KELVIN`/`DEFAULT_MAX_KELVIN` (2000/7000) come with them, the
+same defaults `const.py` has carried since the beginning for the same
+reason.
+
+Found while unifying the two transports' command surfaces, which is what a
+unit contract is for: writing down that colour temperature is 0-100 on the
+wire immediately showed that one of the two callers disagreed.
+
 ### 0.12.0
 
 **`classify.py`: one answer to "what is this device", for both integrations.**

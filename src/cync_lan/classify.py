@@ -184,6 +184,50 @@ def from_ha_brightness(value: int) -> int:
     return round(max(0, min(255, value)) * 100 / 255)
 
 
+# Colour temperature is the same story and a sharper one. Cync speaks 0-100
+# on the wire regardless of what the bulb's real range is, and
+# `CyncDevice.set_temperature` rejects anything above 100 outright. Consumers
+# that talk kelvin have to convert, and the two did not agree about that: the
+# MQTT add-on carried `kelvin2cync`/`cync2kelvin` and used them in both
+# directions, while the Home Assistant integration passed HA's kelvin value
+# straight through - so every colour-temperature change it made was refused
+# with "Invalid temperature! must be 0-100" and never reached the wire.
+#
+# Defaults when a type declares no range of its own. The comment beside them
+# in const.py has always said why: internally cync uses 0-100, so whatever
+# the bulb's real range, the scaling works out.
+DEFAULT_MIN_KELVIN = 2000
+DEFAULT_MAX_KELVIN = 7000
+
+
+def _kelvin_range(features: Optional[LightFeatures]) -> tuple[int, int]:
+    min_k = (features.min_kelvin if features else None) or DEFAULT_MIN_KELVIN
+    max_k = (features.max_kelvin if features else None) or DEFAULT_MAX_KELVIN
+    if max_k <= min_k:  # nonsense metadata must not divide by zero
+        return DEFAULT_MIN_KELVIN, DEFAULT_MAX_KELVIN
+    return min_k, max_k
+
+
+def kelvin_to_cync(kelvin: int, features: Optional[LightFeatures] = None) -> int:
+    """Kelvin as Home Assistant speaks it -> the 0-100 Cync wants."""
+    min_k, max_k = _kelvin_range(features)
+    if kelvin <= min_k:
+        return 0
+    if kelvin >= max_k:
+        return 100
+    return int((100 / (max_k - min_k)) * (kelvin - min_k))
+
+
+def cync_to_kelvin(cync_temp: int, features: Optional[LightFeatures] = None) -> int:
+    """0-100 as the device reports it -> kelvin."""
+    min_k, max_k = _kelvin_range(features)
+    if cync_temp <= 0:
+        return min_k
+    if cync_temp >= 100:
+        return max_k
+    return min_k + int(((max_k - min_k) / 100) * cync_temp)
+
+
 # Type-int conveniences. The *_info functions take metadata because
 # CyncDevice already holds it; these take the type id because an integration
 # working from a cloud export has that and nothing else.
