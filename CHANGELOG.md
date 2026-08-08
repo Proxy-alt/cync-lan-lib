@@ -7,6 +7,34 @@ Assistant `cync_lan` custom_component's own version scheme - all three are
 versioned and released separately. See the root `README.md`/`RELEASING.md`
 on `feature/ha-custom-component` for how the three artifacts relate.
 
+### 0.14.0
+
+**`transport.py`: one command surface, whichever wire it goes out on.**
+Both transports already lived here and already had the same four commands.
+What they lacked was the same shape - a device object on one side, a session
+plus an explicit target on the other; `int` against `bool`; `set_temperature`
+against `set_colour_temp`; and `is_sol_lamp` a caller's problem on BLE while
+TCP works it out itself.
+
+`protocol("tcp", device=...)` and `protocol("ble", session=..., target=...,
+dev_type=...)` both return something satisfying `CyncTransport`, so a caller
+can be handed the name of a transport without knowing which class implements
+it.
+
+**Units are the contract**, stated once because getting them wrong is silent:
+brightness and colour temperature are both 0-100, as the wire speaks them.
+`classify.kelvin_to_cync` is there for callers who have kelvin. Writing that
+down is what found the bug in 0.13.0 - one caller had been sending kelvin
+into a function that refuses anything above 100, for as long as it had
+existed.
+
+Deliberately small. Anything one transport can do and the other cannot stays
+on the concrete class, where it is absent, rather than here, where it would
+be a method that raises on half its implementations. That is also what makes
+this the natural landing site for the BLE command work: a command arriving
+on both sides can move up, and one that only works on the mesh does not have
+to pretend.
+
 ### 0.13.0
 
 **Kelvin conversion, because one consumer had it and the other did not.**
