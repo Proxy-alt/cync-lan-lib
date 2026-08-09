@@ -122,9 +122,24 @@ class nCyncServer:
         self._server = None
         self.start_task = None
         self.ssl_context: Optional[ssl.SSLContext] = None
-        self.host: str = CYNC_SRV_HOST
-        self.port: int = CYNC_SRV_PORT
+        # reload_env() first, then read everything from g.env.
+        #
+        # These five lines used to disagree with each other: cert and key
+        # came from g.env and so were current, while host and port came from
+        # module constants frozen when cync_lan.const was first imported -
+        # and reload_env() was called after they had already been read, so it
+        # could not have helped them even if it had reached those names.
+        #
+        # It worked only because the Home Assistant integration sets its
+        # environment before importing anything from cync_lan, deliberately
+        # and with a comment saying why. That is a sequencing requirement
+        # nothing enforced, and it stops being satisfiable the moment two
+        # consumers share the interpreter and the first one to import wins.
         g.reload_env()
+        self.host: str = g.env.cync_srv_host or CYNC_SRV_HOST
+        self.port: int = (
+            g.env.cync_srv_port if g.env.cync_srv_port is not None else CYNC_SRV_PORT
+        )
         self.cert_file = g.env.cync_srv_ssl_cert
         self.key_file = g.env.cync_srv_ssl_key
         # No self.loop here. It was written and never read anywhere - not in

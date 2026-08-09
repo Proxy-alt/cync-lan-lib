@@ -7,6 +7,42 @@ Assistant `cync_lan` custom_component's own version scheme - all three are
 versioned and released separately. See the root `README.md`/`RELEASING.md`
 on `feature/ha-custom-component` for how the three artifacts relate.
 
+### 0.16.0
+
+**`reload_env()` was the appearance of a mechanism rather than one.** It
+assigned to a list of names under `global` - `CYNC_SRV_HOST`, `CYNC_SSL_CERT`,
+`CYNC_BASE_DIR`, `PERSISTENT_DIR` and a dozen more. Those names are not
+imported into `structs.py`, so each assignment created a *new* module global
+there, read by nothing, while `cync_lan.const` - where every consumer actually
+imports from - was never touched. And a consumer that had already done
+`from cync_lan.const import X` held its own binding regardless, so even
+reaching `const` would not have helped it.
+
+Only `self.env` ever worked, because it is read through an object at the
+point of use. That is now the only part, and the misleading `global`
+statements are gone.
+
+**Four server settings it never carried** now travel with the rest:
+`cync_srv_port`, `max_tcp_conn`, `cmd_broadcasts` and `tcp_whitelist`. Each
+keeps the default `const.py` has always used, so a consumer that sets nothing
+is unaffected, and an unparseable value falls back instead of raising.
+
+**`nCyncServer.__init__` read its port before refreshing, not after.** Five
+consecutive lines disagreed with themselves: `cert_file` and `key_file` came
+from `g.env` and were current, while `host` and `port` came from constants
+frozen when `const` was first imported - and `reload_env()` was called *after*
+they had been read, so it could not have helped them even if it had reached
+those names.
+
+It worked anyway, because the Home Assistant integration sets its environment
+before importing anything from `cync_lan`, deliberately and with a comment
+saying why. That is a sequencing requirement nothing enforced, and it stops
+being satisfiable the moment two consumers share the interpreter and the
+first to import wins - which is the same failure `cync_ble` documented and
+0.11.0 fixed for the cloud client.
+
+This is the last known instance of the shape behind the 0.10.3 outage.
+
 ### 0.15.0
 
 **Six commands ported from the TCP path onto the BLE mesh**, where they were

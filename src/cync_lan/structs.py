@@ -32,6 +32,18 @@ from cync_lan.protocols import MqttSink, StoppableService
 logger = logging.getLogger(CYNC_LOG_NAME)
 
 
+def _env_int(name: str, default: int) -> int:
+    """An int from the environment, falling back rather than raising.
+
+    A typo in one of these used to be able to take the whole server down at
+    import; const.py guards each one individually for the same reason.
+    """
+    try:
+        return int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
 class GlobalObjEnv(BaseModel):
     """
     Environment variables for the global object.
@@ -57,6 +69,15 @@ class GlobalObjEnv(BaseModel):
     appended_config_dir: Optional[str] = None
     base_dir: Optional[str] = None
     app_mitm_logging: bool = False
+    # Server settings that reload_env() did not carry, so the only way to
+    # reach them was to set the environment before anything imported
+    # cync_lan.const - which is a sequencing requirement the Home Assistant
+    # integration meets deliberately, with a comment explaining why, and
+    # which nothing enforces.
+    cync_srv_port: Optional[int] = None
+    max_tcp_conn: Optional[int] = None
+    tcp_whitelist: Optional[list] = None
+    cmd_broadcasts: Optional[int] = None
 
 
 class GlobalObject:
@@ -102,71 +123,62 @@ class GlobalObject:
         #     asyncio.create_task(self.mqtt_client.publish, "")
 
     def reload_env(self):
-        """Re-evaluate environment variables to update constants."""
-        global CYNC_MQTT_HOST, CYNC_MQTT_PORT, CYNC_MQTT_USER, CYNC_MQTT_PASS
-        global CYNC_TOPIC, CYNC_HASS_TOPIC, CYNC_HASS_STATUS_TOPIC, CYNC_BASE_DIR
-        global \
-            CYNC_HASS_BIRTH_MSG, \
-            CYNC_HASS_WILL_MSG, \
-            CYNC_SRV_HOST, \
-            CYNC_EXPORT_HOST, \
-            CYNC_ENABLE_EXPORTER
-        global \
-            CYNC_SSL_CERT, \
-            CYNC_SSL_KEY, \
-            CYNC_ACCOUNT_USERNAME, \
-            CYNC_ACCOUNT_PASSWORD, \
-            PERSISTENT_DIR
-        self.env.base_dir = CYNC_BASE_DIR = os.environ.get(
-            "CYNC_BASE_DIR", "/root/cync-lan"
-        )
-        self.env.account_username = CYNC_ACCOUNT_USERNAME = os.environ.get(
-            "CYNC_ACCOUNT_USERNAME", None
-        )
-        self.env.account_password = CYNC_ACCOUNT_PASSWORD = os.environ.get(
-            "CYNC_ACCOUNT_PASSWORD", None
-        )
-        self.env.mqtt_host = CYNC_MQTT_HOST = os.environ.get(
-            "CYNC_MQTT_HOST", "homeassistant.local"
-        )
-        self.env.mqtt_port = CYNC_MQTT_PORT = int(
-            os.environ.get("CYNC_MQTT_PORT", 1883)
-        )
-        self.env.mqtt_user = CYNC_MQTT_USER = os.environ.get("CYNC_MQTT_USER")
-        self.env.mqtt_pass = CYNC_MQTT_PASS = os.environ.get("CYNC_MQTT_PASS")
-        self.env.mqtt_topic = CYNC_TOPIC = os.environ.get("CYNC_TOPIC", "cync_lan")
-        self.env.mqtt_hass_topic = CYNC_HASS_TOPIC = os.environ.get(
-            "CYNC_HASS_TOPIC", "homeassistant"
-        )
-        self.env.mqtt_hass_status_topic = CYNC_HASS_STATUS_TOPIC = os.environ.get(
+        """Re-read the environment into `self.env`.
+
+        It used to also assign to a list of module-level names via `global`.
+        Those names are not imported into this module, so the statements
+        created new globals here that nothing ever read - and, crucially, did
+        not update `cync_lan.const`, which is where every consumer actually
+        imports from. Anything that had already done
+        `from cync_lan.const import X` held its own binding regardless.
+
+        So the rebinding was not merely redundant, it was the appearance of a
+        mechanism that did not exist. `self.env` is the part that works,
+        because it is read through an object at the point of use, and it is
+        now the only part.
+        """
+        self.env.base_dir = os.environ.get("CYNC_BASE_DIR", "/root/cync-lan")
+        self.env.account_username = os.environ.get("CYNC_ACCOUNT_USERNAME", None)
+        self.env.account_password = os.environ.get("CYNC_ACCOUNT_PASSWORD", None)
+        self.env.mqtt_host = os.environ.get("CYNC_MQTT_HOST", "homeassistant.local")
+        self.env.mqtt_port = int(os.environ.get("CYNC_MQTT_PORT", 1883))
+        self.env.mqtt_user = os.environ.get("CYNC_MQTT_USER")
+        self.env.mqtt_pass = os.environ.get("CYNC_MQTT_PASS")
+        self.env.mqtt_topic = os.environ.get("CYNC_TOPIC", "cync_lan")
+        self.env.mqtt_hass_topic = os.environ.get("CYNC_HASS_TOPIC", "homeassistant")
+        self.env.mqtt_hass_status_topic = os.environ.get(
             "CYNC_HASS_STATUS_TOPIC", "status"
         )
-        self.env.mqtt_hass_birth_msg = CYNC_HASS_BIRTH_MSG = os.environ.get(
-            "CYNC_HASS_BIRTH_MSG", "online"
+        self.env.mqtt_hass_birth_msg = os.environ.get("CYNC_HASS_BIRTH_MSG", "online")
+        self.env.mqtt_hass_will_msg = os.environ.get("CYNC_HASS_WILL_MSG", "offline")
+        self.env.cync_srv_host = os.environ.get("CYNC_SRV_HOST", "0.0.0.0")
+        self.env.cync_export_host = os.environ.get(
+            "CYNC_EXPORT_HOST", self.env.cync_srv_host
         )
-        self.env.mqtt_hass_will_msg = CYNC_HASS_WILL_MSG = os.environ.get(
-            "CYNC_HASS_WILL_MSG", "offline"
-        )
-        self.env.cync_srv_host = CYNC_SRV_HOST = os.environ.get(
-            "CYNC_SRV_HOST", "0.0.0.0"
-        )
-        self.env.cync_export_host = CYNC_EXPORT_HOST = os.environ.get(
-            "CYNC_EXPORT_HOST", CYNC_SRV_HOST
-        )
-        self.env.enable_export_server = CYNC_ENABLE_EXPORTER = (
+        self.env.enable_export_server = (
             os.environ.get("CYNC_ENABLE_EXPORT", "0").casefold() in YES_ANSWER
         )
-        self.env.cync_srv_ssl_cert = CYNC_SSL_CERT = os.environ.get(
-            "CYNC_DEVICE_CERT", f"{CYNC_BASE_DIR}/certs/cert.pem"
+        self.env.cync_srv_ssl_cert = os.environ.get(
+            "CYNC_DEVICE_CERT", f"{self.env.base_dir}/certs/cert.pem"
         )
-        self.env.cync_srv_ssl_key = CYNC_SSL_KEY = os.environ.get(
-            "CYNC_DEVICE_KEY", f"{CYNC_BASE_DIR}/certs/key.pem"
+        self.env.cync_srv_ssl_key = os.environ.get(
+            "CYNC_DEVICE_KEY", f"{self.env.base_dir}/certs/key.pem"
         )
-        self.env.appended_config_dir = PERSISTENT_DIR = os.environ.get(
-            "CYNC_CONFIG_DIR", "/config"
-        )
+        self.env.appended_config_dir = os.environ.get("CYNC_CONFIG_DIR", "/config")
         self.env.app_mitm_logging = (
             os.environ.get("CYNC_APP_MITM_LOGGING", "0").casefold() in YES_ANSWER
+        )
+        # The server settings, read here rather than frozen at import. Each
+        # keeps the same default const.py has always used, so a consumer that
+        # sets nothing is unaffected.
+        self.env.cync_srv_port = _env_int("CYNC_PORT", 23779)
+        self.env.max_tcp_conn = _env_int("CYNC_MAX_TCP_CONN", 8)
+        self.env.cmd_broadcasts = _env_int("CYNC_CMD_BROADCASTS", 2)
+        whitelist = os.environ.get("CYNC_TCP_WHITELIST")
+        self.env.tcp_whitelist = (
+            [x.strip() for x in whitelist.split(",") if x.strip()]
+            if whitelist
+            else None
         )
 
 
