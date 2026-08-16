@@ -47,9 +47,9 @@ ble = [
 cync-lan-ble-provision = "cync_lan.ble_provision:main"
 
 [project.urls]
-Homepage = "https://github.com/Proxy-alt/cync-lan"
-Repository = "https://github.com/Proxy-alt/cync-lan"
-Issues = "https://github.com/Proxy-alt/cync-lan/issues"
+Homepage = "https://github.com/Proxy-alt/cync-lan-lib"
+Repository = "https://github.com/Proxy-alt/cync-lan-lib"
+Issues = "https://github.com/Proxy-alt/cync-lan-lib/issues"
 
 [tool.setuptools.package-data]
 cync_lan = ["py.typed"]
