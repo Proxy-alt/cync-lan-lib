@@ -1049,6 +1049,149 @@ separate, hub-mediated subsystem whose relationship to the REST path (same
 underlying check surfaced two ways, or two independent OTA subsystems) has
 not been traced.
 
+### `F6 11 02 04` / `F6 11 02 03` — query a device's live subKey/accessKey
+
+Follow-up static research (2026-08-31) into the OTA "subscription" blocker (see
+[cloud_independence_research.md](cloud_independence_research.md)'s Finding 9)
+turned up a **confirmed-via-decompiled-source** pair of Telink mesh commands
+that were not on this doc's radar before: `QueryWifiStatusAndKeysCommand`
+(opcode bytes `{-10, 17, 2, 4}` = `F6 11 02 04`) and
+`QueryWifiStatusRouterAndKeysCommand` (`{-10, 17, 2, 3}` = `F6 11 02 03`) -
+same `11 02` Telink vendor-id prefix already documented for `E8 11 02 10`/
+`F7 11 02 0D`/`0C` above. Both are sent via
+`TelinkCommandDelegate.mo14046d(opcodeBytes, meshAddress, 0, continuation)` -
+**targeted at a real `MeshAddress`, not broadcast** - unlike this project's own
+still-broadcast-only `0x49`/`0x4B`/etc. self-addressed commands. As with those,
+the same caution this project has learned the hard way elsewhere applies: these
+bytes are the *inner* Telink opcode as declared on the command class itself,
+not independently confirmed as what actually goes out on the wire or as
+whatever outer op_code wraps it for transport - plausible pending a real
+capture, same caveat as every other opcode in this file that hasn't been
+hardware-tested.
+
+The reply, `WifiConnectionAndKeysStatusNotification`, arrives as a Telink
+*multipart* notification (`TelinkWifiMultipartNotificationJoiner.mo14291c()`,
+subtype byte `0x83`/`0x84`) and is fully decoded there - **confirmed via
+decompiled source**:
+
+```
+[1]      connection status byte -> WifiConnectionStatus enum
+[3..8]   wifiMacAddress   (6 B, colon-joined hex string)
+[10..13] subKey           (4 B, big-endian on the wire - decoded via a
+                            byte-reversal into Utilities.m13395d()'s
+                            little-endian reader)
+[15..18] accessKey        (4 B, same big-endian-on-wire / reversed-to-decode
+                            treatment as subKey)
+```
+
+Bytes 0, 2, 9, 14 are unused/reserved gaps in this layout - not zeroed or
+explained in source, just skipped by the field ranges above.
+
+**Why this matters**: `cloud_independence_research.md`'s Finding 8 established
+that a device's `subKey`/`accessKey` - needed to send the *cloud* TCP
+`subscriptionDevice()` packet at `cm.gelighting.com:23779` - are handed to the
+phone once, during WiFi commissioning, with no REST path to recover them
+afterward. This command is a **third channel** neither REST nor the
+commissioning-time handoff: a live mesh query, sent over the exact same
+unauthenticated relay channel this doc's own Finding 1 (in the research doc)
+already established has no meaningful per-device auth. If cync-lan's local TCP
+server stands in for that relay for an already-paired device the way it
+already does for ordinary control traffic, sending this opcode to the real
+device and decoding the reply per the layout above is - on paper - a way to
+recover a device's current `subKey`/`accessKey` without touching Cync's cloud
+at all. **Not yet attempted against real hardware.** It does not by itself
+solve the OTA-subscribe problem: having the keys still leaves the actual
+cloud-side "mark this device subscribed" bookkeeping unsolved, which is a
+property of Cync's own relay server, not something a local query can fake.
+
+**Update, 2026-08-31**: this specific opcode still hasn't been tried against
+real hardware, but the OTA-subscribe problem it was aimed at got solved a
+different way - see
+[cloud_independence_research.md](cloud_independence_research.md)'s Finding
+11. The app's own live session already had a real `accessKey` cached in
+memory (from ordinary login, not this opcode), which was enough to send a
+real, confirmed-successful subscribe packet directly. This opcode may still
+be useful for a device the current app session hasn't already cached keys
+for, but it's no longer the load-bearing piece it looked like when this
+section was written.
+
+**Follow-up attempt, same day**: tried to invoke `QueryWifiStatusAndKeysCommand` directly via
+Frida against the same emulator session as Finding 11, the same way `subscribeDevice()` was
+called directly. Confirmed along the way: the actual runtime method names in the installed app
+differ from what's in the decompiled sources checked into this project (`DeviceServiceDefault`'s
+`mo13784p` is `X` at runtime; `MacAddressKt`'s `m13563b` is `b`) - R8 renumbers on every build, not
+just every JADX pass, so a name recovered from one decompile of one APK build is not guaranteed to
+match a different build's installed bytecode. Worked around by reflecting the live class
+(`getDeclaredMethods()`) to recover the real names, and by using `ConnectionType.valueOf` logic
+indirectly (enum constant *names* survive obfuscation even when static field names don't - field
+`d` held `WIFI` here, confirmed by declaration order matching `ROUTING, BLE, BLE_PROXY, WIFI,
+WIFI_PROXY`). The call itself then executed synchronously and threw a real, structured
+`DeviceNotFoundException: Device 78:6D:EB:33:5B:46 not found` - this specific service layer
+(`DeviceServiceDefault`/`DeviceController`, the one the app's own debug menu uses) tracks devices
+by a registry `subscribeDevice()`'s lower-level `XDeviceManage` lookup doesn't share; scanning the
+live heap found 1,697 `DeviceId` objects and none matched this device or even shared its vendor
+MAC prefix - whatever populates that registry, ordinary login/polling in this emulator session
+never did. **Not resolved** - would need the app in a state (a Location/room screen actually
+opened, most likely) this test never reached. Stopped here rather than keep guessing at app state.
+
+### New frame types and structural details, from the same live capture
+
+Also from the Finding 11 emulator capture, unrelated to the subscribe investigation itself -
+things about the wire format this project didn't have real bytes for before. All **confirmed via
+live capture**, decoded from an actual device toggle (on then off) and the app's ordinary
+background polling.
+
+**The first 4 bytes of every `0x7`-type (pipe/relay) and `0x8`-type payload are the target
+device's own `deviceId`, big-endian.** Confirmed exactly: this account's real device has
+`deviceId=282105739` (decimal, from its own account record) = `0x10D0978B` - byte-for-byte the
+`10 d0 97 8b` prefix on every single pipe/relay frame captured for it, both directions. Not
+previously documented anywhere in this file.
+
+**The real `SetPowerStateCommand` (`D0 11 02`, per the command catalogue) toggle bytes,
+captured live** - a device toggled on then off from the real app UI, ~2 seconds apart:
+
+```
+ON:  73 00 00 00 1f 10 d0 97 8b 49 41 00 7e 06 00 00 00 f8 d0 0d 00 06 00 00 00 00 0f 80 d0 11 02 01 00 00 56 7e
+OFF: 73 00 00 00 1f 10 d0 97 8b 49 43 00 7e 07 00 00 00 f8 d0 0d 00 07 00 00 00 00 0f 80 d0 11 02 00 00 00 56 7e
+```
+
+The `D0 11 02` mesh opcode itself matches the command catalogue exactly, and the only content
+byte that differs between the two captures is the one immediately after it - `01` (on) vs `00`
+(off) - exactly as expected. The bytes around it (a per-request sequence counter that increments
+between the two calls, an `0x7e`-bracketed inner section, an `f8` marker matching the `f8`/`f9`
+request/response pairing seen elsewhere in this project's captures) are visible and consistent
+between both captures but **not fully mapped** in this pass - flagging the visible structure
+rather than guessing at field boundaries this description isn't confident in.
+
+**A new, previously-undocumented `0x8`-type outer frame** - a status broadcast, not a
+request/response pair (all 6 sightings were server-to-app, none had a matching client request).
+Fired three times in quick succession right after the device-off toggle above, for three
+*different* devices sharing a room/group with the one actually toggled - each carrying a `DB 11 02
+01`-shaped status payload (this project's already-documented status-notification opcode) inside
+the same `deviceId`-prefixed, `0x7e`-bracketed envelope as the pipe/relay frames. Plausible reading:
+this is how the relay pushes "something else in your room just changed" without the app having
+asked - **not independently confirmed**, inferred from the timing and payload shape alone.
+
+**One frame that doesn't map to anything in the command catalogue at all**, seen 3 times over ~35
+minutes of otherwise-ordinary app activity - a `0xA`-type response (same outer type as the
+per-device liveness probe already documented in Finding 11) whose payload contains the literal
+ASCII string `xlink_dev`, followed by what look like eight `(u16, u16)` pairs incrementing 0
+through 7 in the first slot. Real bytes: `10 d0 97 8b [msgid] 00 07 00 09 78 6c 69 6e 6b 5f 64 65
+76 00 00 01 00 01 00 01 00 02 00 01 00 03 00 01 00 04 00 01 00 05 00 01 00 06 00 01 00 07 00 01
+00`. Plausible guess: some kind of capability/feature-version table the relay reports about
+itself - **genuinely not understood**, flagged here only so a future pass with more captures
+doesn't have to rediscover it from scratch.
+
+**The outer-frame response-header nibble rule, resolved with real volume**: Finding 11 flagged
+`0x18` (type 1 response) and `0x9B` (type 9 response) as disagreeing about whether the response bit
+ORs with the `3` marker or replaces it, with too little data to tell which rule was type-specific.
+This capture has hundreds of samples of several types answering that cleanly: **types `1`, `10`,
+and `13` use a mutually-exclusive low nibble** (`3` for a request, `8` for a response - confirmed
+across 3, 750+546, and 14+14 samples respectively) - **while types `7` and `9` OR the response bit
+into the marker** (`3` for a request, `B` for a response - confirmed across 188+208 samples for
+type `7`, and the one subscribe request/reply pair for type `9`). Not yet understood *why* the
+split falls where it does, but the split itself is no longer a two-data-point guess.
+
 ### The two write commands
 
 `0x97` `DeleteAutomationHubCommand` closes an obvious asymmetry: this repo already implements
