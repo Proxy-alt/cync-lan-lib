@@ -964,17 +964,90 @@ and has not been made.
 `0x49` `QueryHubFirmwareUpdates` is **deliberately not implemented**. Its
 reply is not a fixed record like the others: `HubFirmwareUpdatesNotification`
 reads a status byte and three 2-byte counters, then a variable-length list of
-per-device entries each carrying a 2-byte id and two 10-byte version strings.
-Getting the field order or the record stride wrong yields plausible-looking
-garbage rather than an obvious failure, and there is no capture to check a
-decoder against - so it stays documented rather than guessed at.
+per-device entries. A background-agent pass has since decoded the real parser
+class (`HubFirmwareUpdatesNotification.XlinkParser.mo14294a()`) - **confirmed
+via decompiled source, still not against a real packet capture**, so the
+distinction this doc otherwise draws between those two still applies:
+
+```
+[0..1]   updateCount    (u16 LE)
+[2..3]   u16 LE, read but discarded
+[4..5]   u16 LE, read but discarded
+[6]      status byte -> HubUpdateStatusType (0=NONE,1=CHECK_IN_PROGRESS,
+                         2=DOWNLOADING,3=UPGRADING,4=FAILED; raw 50/51 -> UNKNOWN)
+[7]      1 byte, discarded
+[8]      progress       (1 byte)
+if status==FAILED: stop here, entry list is empty
+else, entries loop while remaining bytes >= 27, each entry is 27 bytes:
+  +0     1 byte, discarded
+  +1..2  device id       (u16 LE, masked & 255 - only the low byte is ever used)
+  +3..12 currentVersion  (10 B, NUL-truncated ASCII)
+  +13..22 updateVersion  (10 B, NUL-truncated ASCII)
+  +23..26 4-byte int, discarded
+  id==0 -> hub's own entry (MeshAddress broadcast sentinel), buffered
+           separately and only merged in if exactly 2 such entries were
+           collected - otherwise dropped
+```
+
+27 = 1+2+10+10+4, matching the loop guard. Getting the field order or record
+stride wrong still yields plausible-looking garbage rather than an obvious
+failure - this correction lowers that risk but doesn't eliminate it, so `0x49`
+stays unimplemented in the codebase pending a real capture.
+
+**New, also unimplemented**: sending `0x49` is not one outbound packet but
+two. `QueryHubFirmwareUpdatesCommand.mo14023N()` sends the documented
+32-byte-zero `0x49` envelope, then immediately sends a second hub-envelope
+packet on a distinct outer op, **`0x8C`** (`XlinkCommandCode.HUB_PASSTHROUGH_8C`
+- a real, separate enum value from the `0x94`/`-108` entry that happens to be
+named identically elsewhere in the same file), carrying a fixed 12-byte
+payload: `00 00 01 00 00 01 00 EA 11 02 10 06`. The trailing 5 bytes are
+byte-for-byte `QueryWifiOtaUpdateStatusCommand`'s own opcode bytes (below) -
+embedded directly rather than sent through the normal `0x8E` mesh-relay
+wrapper. The leading 7 bytes' meaning is **not** determined from source -
+plausible only.
 
 The three firmware-*applying* commands (`0x4F` `StartHubFirmwareUpdates`,
 `StartWifiOtaUpdate`, `SetWifiOtaUpdateMode`) are **intentionally absent from
 the codebase entirely**, not merely unwired. Everywhere else in this family a
 wrong predicted `cmd_code` means the device ignores the packet; these flash
 firmware, where the same mistake has a much worse floor. They stay documented
-until someone confirms the envelope against a real packet capture.
+until someone confirms the envelope against a real packet capture - their
+envelopes, confirmed via decompiled source only:
+
+- **`0x4F` `StartHubFirmwareUpdatesCommand`**: 32-byte hub envelope, `0x00` +
+  (`{0x00,0x00}` if hub-only else `{0xFF,0xFF}`) - matches this doc's existing
+  entry. `0xFFFF` is plausibly the real `MeshAddress` broadcast value (already
+  documented elsewhere in this file as `65535`), not an arbitrary mode flag -
+  i.e. this field plausibly selects hub-only vs. all-devices by literal
+  target address. Reply: `HubFirmwareUpdateStatusNotification`, not decoded.
+- **`StartWifiOtaUpdateCommand`** and **`SetWifiOtaUpdateModeCommand`** are
+  *not* hub-envelope commands at all - both build a 5-byte Telink
+  opcode/vendor-id payload and send it through the documented `0x8E`
+  mesh-relay wrapper, targeted at the device's real `MeshAddress` (not
+  broadcast): `StartWifiOtaUpdateCommand` = `F7 11 02 0D 01`,
+  `SetWifiOtaUpdateModeCommand` = `F7 11 02 0C` + `[mode byte]`. Same family:
+  `QueryWifiOtaUpdateStatusCommand` = `EA 11 02 10 06` (the payload embedded
+  in the hidden `0x8C` packet above). All three share the same `F7`/`EA`
+  opcode + `11 02` Telink vendor-id prefix already documented for
+  `query_device_time`'s `E8 11 02 10`.
+
+### Firmware OTA delivery is a separate REST subsystem, not a mesh opcode at all
+
+A live, real-account test (2026-08-30, one real WIFI-type device) confirmed
+the actual path this project would need to elicit/capture an OTA image is
+**not** any of the above at all. See
+[cloud_independence_research.md](cloud_independence_research.md)'s firmware
+OTA section for the full trace: a REST call
+(`POST /upgrade/firmware/check/{deviceId}/geapp`) that returns a direct
+download URL/MD5/size, already implemented read-only in
+`cloud_api.py`'s `check_firmware_update()`/`capture_firmware()` - gated behind
+a device "subscription" state that turns out to be a live TCP/XLink artifact
+(`XlinkAgent.subscribeDevice()`, a packet sent over an open session to
+`cm.gelighting.com:23779` during WiFi commissioning), not something a REST
+call alone can satisfy. The `0x49`/`0x8C`/`0x4F` mesh opcodes above are a
+separate, hub-mediated subsystem whose relationship to the REST path (same
+underlying check surfaced two ways, or two independent OTA subsystems) has
+not been traced.
 
 ### The two write commands
 
