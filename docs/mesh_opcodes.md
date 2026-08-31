@@ -1104,16 +1104,36 @@ solve the OTA-subscribe problem: having the keys still leaves the actual
 cloud-side "mark this device subscribed" bookkeeping unsolved, which is a
 property of Cync's own relay server, not something a local query can fake.
 
-**Update, 2026-08-31**: this specific opcode still hasn't been tried against
-real hardware, but the OTA-subscribe problem it was aimed at got solved a
-different way - see
-[cloud_independence_research.md](cloud_independence_research.md)'s Finding
-11. The app's own live session already had a real `accessKey` cached in
-memory (from ordinary login, not this opcode), which was enough to send a
-real, confirmed-successful subscribe packet directly. This opcode may still
-be useful for a device the current app session hasn't already cached keys
-for, but it's no longer the load-bearing piece it looked like when this
-section was written.
+**Update, 2026-08-31**: the OTA-subscribe problem this opcode was aimed at got solved a different
+way - see [cloud_independence_research.md](cloud_independence_research.md)'s Finding 11. The app's
+own live session already had a real `accessKey` cached in memory (from ordinary login, not this
+opcode), which was enough to send a real, confirmed-successful subscribe packet directly. This
+opcode may still be useful for a device the current app session hasn't already cached keys for,
+but it's no longer the load-bearing piece it looked like when this section was written.
+
+**This opcode was tried against real hardware, later the same day** - a genuinely mixed result,
+recorded precisely rather than rounded up or down. Sent via `XlinkAgent.sendPipeData(device, [F6 11
+02 04], 0, listener)` (bypassing the `DeviceService`/`DeviceController` layer the app's own debug
+menu uses for this - see the `QueryWifiStatusAndKeysCommand` attempt above; `sendPipeData` uses the
+same `XDeviceManage` device lookup `subscribeDevice()` already proved works). **Confirmed sent**:
+`73 00 00 00 0b 10 d0 97 8b 76 45 00 f6 11 02 04` - the device's own `deviceId` (`10 d0 97 8b`,
+matching the same field confirmed elsewhere in this file), a 2-byte msgId (`76 45` = `30277`,
+exactly matching `sendPipeData()`'s own return value - confirms the SDK returns the msgId it just
+assigned), a `00` channel byte, then the raw opcode. **Confirmed acknowledged**: `7b 00 00 00 07 10
+d0 97 8b 76 45 00` arrived ~150ms later - same deviceId and msgId echoed back, `type=7`'s
+already-documented response-header shape (`0x7B`, marker OR'd with response bit). This is a
+simpler, unwrapped pipe-frame shape - `[deviceId][msgId][channel][raw opcode bytes]`, no `0x7E`
+HDLC bracketing - distinct from the `SetPowerStateCommand` capture elsewhere in this file, which
+goes through the full `DeviceCommand`/`DeviceController` path and gets wrapped in that bracketed
+envelope. **Not confirmed**: no `WifiConnectionAndKeysStatusNotification`-shaped reply (or anything
+resembling one) appeared for this device in several seconds of capture after the ack, despite the
+capture continuing to show dozens of other devices' ordinary status frames throughout that same
+window - so the capture pipeline itself was demonstrably still working. Plausible reads, neither
+confirmed: the device may need the opcode delivered through the proper mesh-relay (`0x8E`)
+envelope rather than a bare `sendPipeData()` payload for its Telink stack to recognize it as this
+specific query, or this particular device/firmware may simply not implement this query at all
+despite the SDK declaring it generically. Left here - the send format is now real and confirmed,
+the reply is not.
 
 **Follow-up attempt, same day**: tried to invoke `QueryWifiStatusAndKeysCommand` directly via
 Frida against the same emulator session as Finding 11, the same way `subscribeDevice()` was
