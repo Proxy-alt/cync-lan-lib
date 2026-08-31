@@ -4476,9 +4476,6 @@ class CyncTCPSession:
             return
 
         cync_device: CyncDevice = g.ncync_server.node_devices.get(dev_id)
-        capture_unsupported_device(
-            lp, dev_id, from_pkt=from_pkt, ctrl_bytes=b"\xfa\xdb", raw=packet_data[1:-1]
-        )
         if not cync_device:
             # dev_id is likely a Cync room/group pseudo-ID (not exported as a controllable
             # device), broadcast by every physical device in the mesh on each status update.
@@ -4649,6 +4646,21 @@ class CyncTCPSession:
                                 )
                         except Exception as e:
                             logger.debug(f"{lp} Exception during firmware parsing: {e}")
+
+                elif ctrl_bytes == b"\xf9\x8e":
+                    # Same PASSTHROUGH_8E family as fa 8e above, just carrying a
+                    # payload that isn't a firmware string (packet_data[1] != 0x00
+                    # in every capture seen so far). Confirmed via the decompiled
+                    # app: XlinkCommandCode keys 0x8E by byte value regardless of
+                    # the fa/f9 prefix, and the app's own dispatcher routes it to
+                    # XlinkPassthroughNotificationParser - the same generic Telink
+                    # mesh-relay handler as fa 8e, not a command-result/ack parser.
+                    # Benign/expected, not actionable.
+                    if CYNC_RAW:
+                        logger.debug(
+                            f"{lp} Passthrough (f9 8e) notification, safe to ignore\n\n"
+                            f"HEX: {packet_data[1:-1].hex(' ')}\nINT: {list(packet_data[1:-1])}"
+                        )
 
                 elif try_resolve_telink_notification(packet_data):
                     # A relayed Telink mesh notification answering one of the
