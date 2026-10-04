@@ -4676,6 +4676,18 @@ class CyncTCPSession:
                         except Exception as e:
                             logger.debug(f"{lp} Exception during firmware parsing: {e}")
 
+                elif ctrl_bytes == b"\xfa\xd9":
+                    # Same bulk per-device status struct the 0x83 handler already
+                    # recognises (see its fa d9 branch: seen alongside firmware
+                    # updates, one 4-byte block per device). Arrives here on the
+                    # 0x73 wrapper - 180 of these landed in unsupported_devices.log
+                    # as "unknown". Nothing consumes it, so debug-only.
+                    if CYNC_RAW:
+                        logger.debug(
+                            f"{lp} bulk status (fa d9), safe to ignore\n\n"
+                            f"HEX: {packet_data[1:-1].hex(' ')}\nINT: {list(packet_data[1:-1])}"
+                        )
+
                 elif ctrl_bytes == b"\xf9\x8e":
                     # Same PASSTHROUGH_8E family as fa 8e above, just carrying a
                     # payload that isn't a firmware string (packet_data[1] != 0x00
