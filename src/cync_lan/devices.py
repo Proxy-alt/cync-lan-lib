@@ -4087,7 +4087,7 @@ class CyncTCPSession:
 
             if length_needed > data_len:
                 self.needs_more_data = True
-                logger.warning(
+                logger.debug(
                     f"{loop_lp} Packet requires more data! "
                     f"need={length_needed}, have={data_len}. Storing for next read..."
                 )
