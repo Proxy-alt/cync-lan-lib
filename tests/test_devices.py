@@ -1704,6 +1704,10 @@ async def test_mitm_logger_survives_a_session_with_no_node_yet(tmp_path, monkeyp
     session = _fake_session(node=None)
     session._setup_mitm_logger()
     assert session.mitm_logger is not None
+    # The file is opened lazily, off the event loop, on the first record.
+    session.mitm_logger.info("first record")
+    for h in session.mitm_logger.handlers:
+        h.flush()
     assert any(tmp_path.iterdir()), "expected a log file named after the address"
 
 

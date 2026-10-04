@@ -42,6 +42,7 @@ from cync_lan.metadata.model_info import (
     DeviceTypeInfo,
     device_type_map,
 )
+from cync_lan.logfiles import make_capture_handler, prune_old_logs
 from cync_lan.packet import PacketBuilder
 from cync_lan.structs import (
     CacheData,
@@ -132,7 +133,7 @@ def _get_unsupported_logger() -> logging.Logger:
     formatter = logging.Formatter(
         "%(asctime)s.%(msecs)03d %(message)s", datefmt="%Y/%m/%d %H:%M:%S"
     )
-    file_handler = logging.handlers.TimedRotatingFileHandler(log_path, when="midnight")
+    file_handler = make_capture_handler(log_path)
     file_handler.setFormatter(formatter)
     ulogger.addHandler(file_handler)
     _unsupported_logger = ulogger
@@ -169,9 +170,7 @@ def _get_experimental_logger() -> logging.Logger:
         formatter = logging.Formatter(
             "%(asctime)s.%(msecs)03d %(message)s", datefmt="%Y/%m/%d %H:%M:%S"
         )
-        file_handler = logging.handlers.TimedRotatingFileHandler(
-            log_path, when="midnight"
-        )
+        file_handler = make_capture_handler(log_path)
         file_handler.setFormatter(formatter)
         elogger.addHandler(file_handler)
     except OSError as e:
@@ -3828,9 +3827,7 @@ class CyncTCPSession:
         self.mitm_logger.propagate = False
 
         try:
-            file_handler = logging.handlers.TimedRotatingFileHandler(
-                log_file, when="midnight"
-            )
+            file_handler = make_capture_handler(log_file)
         except OSError as exc:
             logger.warning(
                 f"{lp} cannot open {log_file} ({exc}); continuing without "
@@ -3839,6 +3836,9 @@ class CyncTCPSession:
             return
         file_handler.setFormatter(formatter)
         self.mitm_logger.addHandler(file_handler)
+        # Each day is a new file name here, so the handler's own backupCount
+        # never sees yesterday's files - sweep the directory instead.
+        prune_old_logs(log_dir)
         if (CYNC_MITM_DEV_LOGGER and not self.is_app) or (
             CYNC_MITM_APP_LOGGER and self.is_app
         ):
