@@ -7,6 +7,41 @@ Assistant `cync_lan` custom_component's own version scheme - all three are
 versioned and released separately. See the root `README.md`/`RELEASING.md`
 on `feature/ha-custom-component` for how the three artifacts relate.
 
+### 0.16.1
+
+**Capture logs no longer grow without bound.** Every capture log (per-connection
+MITM, `unsupported_devices.log`, `experimental_features.log`) used a daily
+`TimedRotatingFileHandler` with no `backupCount`, so rotated files were never
+deleted. The MITM logs were worse: their file names embed the date, so each day
+was a new base name and a handler's own retention could never see the previous
+days. One Home Assistant install had accumulated about 10 GB across 5,000 files.
+Retention is now 14 days (`CYNC_LOG_RETENTION_DAYS`; `0` disables pruning), and
+the MITM directory is swept for files older than that. The setting is read when
+used rather than at import, so a consumer that sets it after importing
+`cync_lan.const` is still honoured.
+
+**Log writes no longer happen on the event loop.** Opening a log file, and every
+write to it, ran synchronously on the loop, which Home Assistant reports as a
+blocking call. Files now open lazily and records are written by a short-lived
+background thread that exits once its queue is empty (Home Assistant's test
+harness rejects threads that outlive a test). `flush()` and `close()` wait for
+the queue, so code that reads a log straight after writing it still works. One
+visible difference: a capture log is created on its first record, not when its
+logger is set up.
+
+**Less noise.** "Packet requires more data" is ordinary TCP reassembly, not a
+warning, so it is DEBUG now. The 0x73 wrapper's `fa d9` bulk status packet is the
+same struct the 0x83 wrapper already recognised, and no longer lands in
+`unsupported_devices.log`. Device 183 and the `f9 8e` passthrough, the two
+largest sources in that file, were already fixed after 0.16.0 and ship here for
+the first time.
+
+**New: `identify_raw_device(dev_id, on=True)`.** `CyncDevice.identify()` for a
+mesh address that answers status broadcasts but has no `CyncDevice` (not in the
+account's export), so an unknown `dev_id` from `unsupported_devices.log` can be
+found by making it announce itself. Experimental, same command and confirmation
+status as `identify()`.
+
 ### 0.16.0
 
 **`reload_env()` was the appearance of a mechanism rather than one.** It
