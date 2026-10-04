@@ -61,6 +61,7 @@ __all__ = [
     "broadcast_control_command",
     "execute_scene",
     "set_group_power",
+    "identify_raw_device",
     "delete_scene",
     "delete_schedule",
     "toggle_automation",
@@ -717,6 +718,34 @@ async def set_group_power(group_id: int, state: int) -> None:
     payload = struct.pack(">BBBBB", 0x11, 0x02, state, 0x00, 0x00)
     m_cb = ControlMessageCallback(msg_id=0x00, message=None, sent_at=0.0, callback=None)
     await broadcast_control_command(op, cmd_, target_id, sub_id, payload, m_cb, lp)
+
+
+async def identify_raw_device(dev_id: int, on: bool = True, sub_id: int = 0x00) -> None:
+    """EXPERIMENTAL: same command as CyncDevice.identify(), but targets a raw
+    MeshAddress directly instead of a CyncDevice.
+
+    For a device that is physically present on the mesh (answers status
+    broadcasts, has a real dev_id) but isn't in node_devices - not owned by,
+    or removed from, the Cync account - so there is no CyncDevice to call
+    .identify() on. Same op/payload as CyncDevice.identify(); only the
+    addressing differs, going straight through broadcast_control_command()
+    the way set_group_power() and execute_scene() do for the same reason.
+
+    See CyncDevice.identify()'s docstring for the command itself (confirmed
+    on real hardware, 0x8E mesh-relay family, IdentifyDeviceCommand.java).
+    The device keeps announcing until told to stop; call again with on=False.
+    """
+    lp = "identify_raw_device:"
+    _warn_experimental_cmd_code(lp, "identify_raw_device")
+    if not (0 <= dev_id <= 0xFF):
+        logger.error(f"{lp} Invalid dev_id: {dev_id} must be 0-255")
+        return
+    payload = struct.pack(">BBBBB", 0xF7, 0x11, 0x02, 0x03, 1 if on else 2)
+    cmd_ = 7 + len(payload)
+    m_cb = ControlMessageCallback(msg_id=0x00, message=None, sent_at=0.0, callback=None)
+    await broadcast_control_command(
+        0x8E, cmd_, dev_id, sub_id, payload, m_cb, lp, repeat_op_code=False
+    )
 
 
 async def execute_scene(scene_id: int) -> None:
