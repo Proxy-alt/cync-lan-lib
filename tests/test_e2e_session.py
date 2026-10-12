@@ -491,3 +491,32 @@ async def test_an_unwritable_capture_log_does_not_cost_the_device(
                 assert await cloud.wait_for_bytes(1)
         finally:
             await _shutdown(server, task)
+
+
+async def test_a_device_reset_takes_its_session_out_of_the_pool(
+    real_sockets, certs, monkeypatch
+):
+    """#22: a device resetting its connection must leave the broadcast pool
+    straight away, not whenever a later write happens to notice."""
+    monkeypatch.setenv("CYNC_CLOUD_PASSTHROUGH", "0")
+    server, port, task = await _serve(certs)
+    try:
+        async with VirtualCyncDevice("127.0.0.1", port) as device:
+            await device.send(build_23_auth())
+            assert await device.read_until(0xA3) is not None
+            # The MeshInfo request is the last write the handshake makes. A
+            # write after the reset would clean up on its own and hide #22.
+            assert await device.read_until(0x73) is not None
+            session = server.tcp_connections["127.0.0.1"]
+            assert server.get_dev_tcp_pool_sync() == [session]
+
+            device.writer.transport.abort()
+            for _ in range(40):
+                if session.is_closed():
+                    break
+                await asyncio.sleep(0.05)
+
+            assert session.is_closed(), "dead session was left open"
+            assert server.get_dev_tcp_pool_sync() == []
+    finally:
+        await _shutdown(server, task)
