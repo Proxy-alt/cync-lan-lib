@@ -36,13 +36,13 @@ from cync_lan.const import (
     STREAM_CHUNK_SIZE,
     TCP_BLACKHOLE_DELAY,
 )
+from cync_lan.logfiles import make_capture_handler, prune_old_logs
 from cync_lan.metadata.model_info import (
     MULTI_ENDPOINT_TYPES,
     DeviceClassification,
     DeviceTypeInfo,
     device_type_map,
 )
-from cync_lan.logfiles import make_capture_handler, prune_old_logs
 from cync_lan.packet import PacketBuilder
 from cync_lan.structs import (
     CacheData,
@@ -663,7 +663,12 @@ async def broadcast_control_command(
                     logger.debug(f"{lp} Sending{str_appnd}")
 
     if tasks:
-        await asyncio.gather(*tasks)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        failures = [r for r in results if isinstance(r, BaseException)]
+        for exc in failures:
+            logger.warning(f"{lp} write to a bridge failed: {exc!r}")
+        if len(failures) == len(results):
+            raise failures[0]
         return True
     return False
 
@@ -5196,8 +5201,10 @@ class CyncTCPSession:
                                 f"the device itself hasn't called close(). The device probably "
                                 f"dropped the connection (lost power). Removing {self.ip_address}"
                             )
+                            # None when a concurrent write already removed it (#20)
                             off_dev = await g.ncync_server.remove_tcp_device(self)
-                            asyncio.create_task(off_dev.close())
+                            if off_dev is not None:
+                                asyncio.create_task(off_dev.close())
 
                         else:
                             logger.debug(

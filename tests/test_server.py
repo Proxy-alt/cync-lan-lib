@@ -184,6 +184,15 @@ async def test_remove_unknown_device_is_a_noop(server):
     assert await server.remove_tcp_device("192.168.1.1") is None
 
 
+async def test_remove_stale_session_keeps_the_newer_one(server):
+    stale = _session(ip="10.0.0.9")
+    current = _session(ip="10.0.0.9")
+    server.tcp_connections["10.0.0.9"] = current
+
+    assert await server.remove_tcp_device(stale) is None
+    assert server.tcp_connections["10.0.0.9"] is current
+
+
 # --------------------------------------------------------------------------
 # Connection registration
 # --------------------------------------------------------------------------
