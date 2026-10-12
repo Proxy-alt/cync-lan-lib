@@ -166,7 +166,8 @@ class nCyncServer:
                 device = self.tcp_connections[device]
 
         if isinstance(device, CyncTCPSession):
-            if device.ip_address in self.tcp_connections:
+            # A stale session must not evict the newer one registered at its IP.
+            if self.tcp_connections.get(device.ip_address) is device:
                 dev = self.tcp_connections.pop(device.ip_address, None)
                 if dev is not None:
                     logger.debug(
