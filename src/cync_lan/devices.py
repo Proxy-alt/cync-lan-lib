@@ -36,13 +36,13 @@ from cync_lan.const import (
     STREAM_CHUNK_SIZE,
     TCP_BLACKHOLE_DELAY,
 )
+from cync_lan.logfiles import make_capture_handler, prune_old_logs
 from cync_lan.metadata.model_info import (
     MULTI_ENDPOINT_TYPES,
     DeviceClassification,
     DeviceTypeInfo,
     device_type_map,
 )
-from cync_lan.logfiles import make_capture_handler, prune_old_logs
 from cync_lan.packet import PacketBuilder
 from cync_lan.structs import (
     CacheData,
@@ -5119,6 +5119,10 @@ class CyncTCPSession:
                             f"{lp} read() returned False, exiting {name} "
                             f"(started at: {datetime.datetime.fromtimestamp(started_at)})..."
                         )
+                        # A reconnect can swap a new socket into this session (#22)
+                        owns_session = self.tasks.receive is asyncio.current_task()
+                        if owns_session and not self.is_closed():
+                            asyncio.create_task(self.close())
                         break
                     if not data:
                         await asyncio.sleep(0)
