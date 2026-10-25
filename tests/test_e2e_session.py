@@ -71,11 +71,8 @@ async def _serve(certs: tuple[str, str]) -> tuple[nCyncServer, int, asyncio.Task
 async def _shutdown(server: nCyncServer, task: asyncio.Task) -> None:
     sessions = list(server.tcp_connections.values())
     for session in sessions:
-        # stop_proxy() before close(): close() does not tear the cloud
-        # connection down, and a relay left open keeps the fake cloud's
-        # handler in read() forever.
-        with contextlib.suppress(Exception):
-            await session.stop_proxy()
+        # close() tears the cloud relay down too - see
+        # test_closing_a_passthrough_session_hangs_up_on_the_cloud.
         with contextlib.suppress(Exception):
             await session.close()
     server._server.close()
@@ -403,6 +400,58 @@ async def test_passthrough_comes_back_when_the_cloud_does(
         with contextlib.suppress(Exception):
             await first_cloud.__aexit__()
         await _shutdown(server, task)
+
+
+async def test_closing_a_passthrough_session_hangs_up_on_the_cloud(
+    real_sockets, certs, monkeypatch, tmp_path
+):
+    """close() used to leave the relay running. Proxy-alt/cync-lan-lib#24.
+
+    The cloud then believed the device was still connected and routed app
+    commands into a session with no device behind it, and the next packet
+    it sent crashed the relay on the nulled writer, which turned passthrough
+    off. A closed session must hang up on the cloud and still be ready to
+    relay again when the device comes back.
+    """
+    monkeypatch.setattr(
+        "cync_lan.devices.CYNC_MITM_LOG_DIR", str(tmp_path / "mitm"), raising=False
+    )
+    monkeypatch.setenv("CYNC_CLOUD_PASSTHROUGH", "1")
+    monkeypatch.setenv("CYNC_CLOUD_IP", "127.0.0.1")
+    async with FakeCloud(*certs) as cloud:
+        monkeypatch.setenv("CYNC_CLOUD_PORT", str(cloud.port))
+        server, port, task = await _serve(certs)
+        try:
+            auth = build_23_auth()
+            async with VirtualCyncDevice("127.0.0.1", port) as device:
+                await device.send(auth)
+                assert await cloud.wait_for_bytes(len(auth))
+                session = server.tcp_connections["127.0.0.1"]
+                await session.close()
+
+                assert session.tasks.proxy_task is None
+                assert session.cloud_writer is None
+                cloud_side = cloud._peers[0]
+                for _ in range(50):
+                    if cloud_side.is_closing():
+                        break
+                    await asyncio.sleep(0.05)
+                assert cloud_side.is_closing(), (
+                    "the cloud still holds a connection for a closed session"
+                )
+                # Still a passthrough session - only the connection ended.
+                assert session.mitm_mode is True
+                assert session.passthrough is True
+
+            async with VirtualCyncDevice("127.0.0.1", port) as device:
+                await device.send(auth)
+                assert await cloud.wait_for_bytes(2 * len(auth)), (
+                    "the reconnected device was not relayed"
+                )
+                assert cloud.connections == 2
+                assert server.tcp_connections["127.0.0.1"].passthrough is True
+        finally:
+            await _shutdown(server, task)
 
 
 async def test_a_capture_session_is_left_alone_when_the_cloud_dies(

@@ -5227,6 +5227,20 @@ class CyncTCPSession:
             await self.tasks.cancel_all()
         except Exception as e:
             logger.exception(f"{lp} Exception during device task .cancel_all(): {e}")
+        # The cloud relay is not among the tasks cancel_all() iterates, so it
+        # outlived every close(). The cloud kept a live connection for a device
+        # that was gone and went on routing app commands into it - lost, or
+        # delivered only once the device reconnected - and the first packet it
+        # relayed hit the writer nulled below ("Error in cloud proxy:
+        # 'NoneType' object has no attribute 'write'"), which then switched
+        # passthrough off as if the cloud had died. Proxy-alt/cync-lan-lib#24.
+        #
+        # stop_proxy() leaves mitm_mode and passthrough alone, so a reconnect
+        # through existing_init() opens a fresh relay for the new handshake.
+        try:
+            await self.stop_proxy()
+        except Exception as e:
+            logger.exception(f"{lp} Exception stopping the cloud relay: {e}")
         try:
             if self.writer:
                 async with self.write_lock:
