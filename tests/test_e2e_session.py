@@ -540,3 +540,47 @@ async def test_an_unwritable_capture_log_does_not_cost_the_device(
                 assert await cloud.wait_for_bytes(1)
         finally:
             await _shutdown(server, task)
+
+
+async def test_concurrent_commands_to_a_dropped_bridge_do_not_crash(
+    real_sockets, certs, monkeypatch
+):
+    """#20: a light group fans one service call out to every member at once,
+    so two commands can land on the same bridge just after it lost power.
+    The first write removes the session; the second must not crash on the
+    None that remove_tcp_device() then returns."""
+    from cync_lan.devices import broadcast_control_command
+    from cync_lan.structs import ControlMessageCallback
+
+    monkeypatch.setenv("CYNC_CLOUD_PASSTHROUGH", "0")
+    server, port, task = await _serve(certs)
+    try:
+        async with VirtualCyncDevice("127.0.0.1", port) as device:
+            await device.send(build_23_auth())
+            assert await device.read_until(0xA3) is not None
+            session = server.tcp_connections["127.0.0.1"]
+            assert session.ready_to_control is True
+
+            # The transport is going away, but nothing has called close() yet.
+            session.writer.transport.abort()
+            assert session.writer.is_closing() and not session.is_closed()
+
+            def command():
+                m_cb = ControlMessageCallback(
+                    msg_id=0, message=None, sent_at=0.0, callback=None
+                )
+                return broadcast_control_command(
+                    op=0xD0,
+                    cmd_=0x0D,
+                    target_id=5,
+                    sub_id=0,
+                    payload=b"",
+                    m_cb=m_cb,
+                    lp="test:",
+                )
+
+            await asyncio.gather(command(), command())
+
+            assert "127.0.0.1" not in server.tcp_connections
+    finally:
+        await _shutdown(server, task)
