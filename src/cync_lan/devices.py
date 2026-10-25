@@ -5124,6 +5124,10 @@ class CyncTCPSession:
                             f"{lp} read() returned False, exiting {name} "
                             f"(started at: {datetime.datetime.fromtimestamp(started_at)})..."
                         )
+                        # A reconnect can swap a new socket into this session (#22)
+                        owns_session = self.tasks.receive is asyncio.current_task()
+                        if owns_session and not self.is_closed():
+                            asyncio.create_task(self.close())
                         break
                     if not data:
                         await asyncio.sleep(0)

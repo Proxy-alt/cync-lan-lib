@@ -1632,6 +1632,52 @@ async def test_broadcast_raises_when_every_bridge_fails():
         )
 
 
+def _session_with_reset_reader(reset: asyncio.Event):
+    from cync_lan.devices import CyncTCPSession
+
+    async def read(_chunk):
+        await reset.wait()
+        raise ConnectionResetError(104, "reset by peer")
+
+    reader = MagicMock()
+    reader.at_eof.return_value = False
+    reader.read = read
+    session = CyncTCPSession(reader=reader, writer=MagicMock(), ip_address="127.0.0.1")
+    session.close = AsyncMock()
+    return session
+
+
+async def test_receive_task_closes_the_session_when_the_read_fails():
+    """#22: the loop used to exit without closing, leaving a dead session in
+    the broadcast pool and its device marked online for many minutes."""
+    reset = asyncio.Event()
+    session = _session_with_reset_reader(reset)
+    session.tasks.receive = asyncio.create_task(session.receive_task())
+
+    reset.set()
+    await session.tasks.receive
+    await asyncio.sleep(0)
+
+    session.close.assert_awaited_once()
+
+
+async def test_stale_receive_task_leaves_a_reconnected_session_open():
+    """A reconnect swaps a new socket into the same session and replaces its
+    tasks. The old loop failing afterwards must not close the new connection."""
+    reset = asyncio.Event()
+    session = _session_with_reset_reader(reset)
+    stale = asyncio.create_task(session.receive_task())
+    session.tasks.receive = stale
+    await asyncio.sleep(0)
+    session.tasks.receive = MagicMock()
+
+    reset.set()
+    await stale
+    await asyncio.sleep(0)
+
+    session.close.assert_not_awaited()
+
+
 async def test_parse_83_device_state_records_relay_source():
     """Diagnostic entity support: whichever TCP session parses a status
     update for a device is recorded as that device's relay_source - the
