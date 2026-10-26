@@ -7,6 +7,39 @@ Assistant `cync_lan` custom_component's own version scheme - all three are
 versioned and released separately. See the root `README.md`/`RELEASING.md`
 on `feature/ha-custom-component` for how the three artifacts relate.
 
+### 0.16.2
+
+**Dropped connections are cleaned up straight away.** When a device reset its
+connection, the session stayed open: it kept its place in the command pool and
+its device stayed marked online, for anywhere from seconds to about 40 minutes,
+until a later write happened to notice. Commands sent in that window went into
+a dead socket. The session now closes as soon as the read fails
+([#22](https://github.com/Proxy-alt/cync-lan-lib/issues/22), contributed by
+@brycewc).
+
+**Two commands to a dropped bridge no longer crash.** A light group sends to
+every member at once, so two writes could find the same dead bridge. The
+second crashed with `AttributeError: 'NoneType' object has no attribute
+'close'`, the command was lost, and Home Assistant automations aborted. One
+failing bridge also no longer fails a command that another bridge delivered
+([#20](https://github.com/Proxy-alt/cync-lan-lib/issues/20), contributed by
+@brycewc).
+
+**Cloud passthrough: a closed session now hangs up on the cloud.** `close()`
+stopped everything except the cloud relay. The cloud kept a connection open
+for a device that was gone and kept routing Cync app commands into it, so those
+commands were lost or arrived only after the device reconnected. The first
+packet relayed after that crashed with "Error in cloud proxy: 'NoneType' object
+has no attribute 'write'" and switched passthrough off for the session. The
+relay now closes with the session, and a reconnect opens a new one
+([#24](https://github.com/Proxy-alt/cync-lan-lib/issues/24)).
+
+**Account login failures say why.** A rejected OTP or token request logged only
+"400, Bad Request". The vendor's reason is now logged too, for example
+`HTTP 400: password error (code 4001007)`. A wrong password, a malformed email
+and an expired code all return the same status, so this is what tells them
+apart ([Proxy-alt/cync-lan#51](https://github.com/Proxy-alt/cync-lan/issues/51)).
+
 ### 0.16.1
 
 **Capture logs no longer grow without bound.** Every capture log (per-connection

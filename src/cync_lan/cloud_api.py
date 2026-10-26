@@ -39,6 +39,27 @@ def _write_yaml_and_chmod(path: Path, data: dict) -> None:
     os.chmod(path, 0o777)
 
 
+async def _vendor_error(resp: aiohttp.ClientResponse) -> str:
+    """The vendor's own reason for an error response, for the log.
+
+    raise_for_status() releases the response before raising, so the body -
+    `{"error": {"msg": "password error", "code": 4001007}}` and the like - was
+    gone by the time anything logged, and every auth failure read as a bare
+    "400, Bad Request". Which 400 it is decides the fix: a wrong password, a
+    malformed email and an expired code all arrive with that same status.
+    Proxy-alt/cync-lan#51.
+    """
+    try:
+        body = await resp.text()
+    except Exception:  # noqa: BLE001 - diagnostics must not mask the failure
+        return "(body unreadable)"
+    try:
+        err = json.loads(body)["error"]
+        return f"{str(err['msg']).strip()} (code {err['code']})"
+    except Exception:  # noqa: BLE001 - not the usual shape, show it raw
+        return body[:200] or "(empty body)"
+
+
 # Cync's own 4-slot motion-sensor schedule model (confirmed via the decompiled
 # Android app's ScheduleTimeSlot.java - see docs/cync_automations.md for the
 # full research). Each device GROUP (not individual device) can carry up to
@@ -289,7 +310,12 @@ class CyncCloudAPI:
                     json=auth_data,
                     timeout=aiohttp.ClientTimeout(total=self.api_timeout),
                 )
-                otp_r.raise_for_status()
+                if not otp_r.ok:
+                    logger.error(
+                        f"{lp} Failed to request OTP code: HTTP {otp_r.status}: "
+                        f"{await _vendor_error(otp_r)}"
+                    )
+                    return False
             except aiohttp.ClientResponseError as e:
                 logger.error(f"{lp} Failed to request OTP code: {e}")
                 return False
@@ -401,7 +427,12 @@ class CyncCloudAPI:
             resp = await self.http_session.post(
                 url, json=data, timeout=aiohttp.ClientTimeout(total=self.api_timeout)
             )
-            resp.raise_for_status()
+            if not resp.ok:
+                logger.error(
+                    f"{lp} Failed to authenticate: HTTP {resp.status}: "
+                    f"{await _vendor_error(resp)}"
+                )
+                return False
             iat = datetime.datetime.now(datetime.UTC)
             token_data = await resp.json()
             # add issued_at to the token data for computing the expiration datetime

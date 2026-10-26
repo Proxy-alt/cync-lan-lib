@@ -13,6 +13,8 @@ import logging
 import struct
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+
 import cync_lan.devices as devices
 from cync_lan.const import FACTORY_EFFECTS_BYTES, LIGHT_RUN_MODE_EFFECTS
 from cync_lan.devices import (
@@ -1569,6 +1571,111 @@ async def test_close_is_a_noop_for_online_when_no_node_is_set():
     await session.close()  # must not raise
 
     g.mqtt_client.remove_mitm_button.assert_not_awaited()
+
+
+async def test_write_on_dropped_session_already_removed_does_not_raise():
+    """#20: two concurrent writes notice the same dropped connection. The
+    first removes the session, so remove_tcp_device returns None for the
+    second, which used to crash on None.close()."""
+    from cync_lan.devices import CyncTCPSession
+
+    g = GlobalObject()
+    g.ncync_server = MagicMock()
+    g.ncync_server.remove_tcp_device = AsyncMock(return_value=None)
+
+    writer = MagicMock()
+    writer.is_closing.return_value = True
+    session = CyncTCPSession(reader=MagicMock(), writer=writer, ip_address="127.0.0.1")
+
+    assert await session.write(b"\x00") is None
+    g.ncync_server.remove_tcp_device.assert_awaited_once_with(session)
+    writer.write.assert_not_called()
+
+
+class _FailingBridgeDevice(_FakeBridgeDevice):
+    async def write(self, data: bytes):
+        raise TimeoutError("bridge powered off")
+
+
+async def test_broadcast_survives_one_failing_bridge():
+    from cync_lan.structs import ControlMessageCallback
+
+    g = GlobalObject()
+    good, bad = _FakeBridgeDevice(), _FailingBridgeDevice()
+    g.ncync_server = MagicMock()
+    g.ncync_server.get_dev_tcp_pool = AsyncMock(return_value=[bad, good])
+    m_cb = ControlMessageCallback(msg_id=0x00, message=None, sent_at=0.0, callback=None)
+    sent = await broadcast_control_command(
+        op=0xD0, cmd_=0x0D, target_id=5, sub_id=0, payload=b"", m_cb=m_cb, lp="test:"
+    )
+
+    assert sent is True
+    assert len(good.written) == 1
+
+
+async def test_broadcast_raises_when_every_bridge_fails():
+    from cync_lan.structs import ControlMessageCallback
+
+    g = GlobalObject()
+    g.ncync_server = MagicMock()
+    g.ncync_server.get_dev_tcp_pool = AsyncMock(return_value=[_FailingBridgeDevice()])
+    m_cb = ControlMessageCallback(msg_id=0x00, message=None, sent_at=0.0, callback=None)
+    with pytest.raises(TimeoutError):
+        await broadcast_control_command(
+            op=0xD0,
+            cmd_=0x0D,
+            target_id=5,
+            sub_id=0,
+            payload=b"",
+            m_cb=m_cb,
+            lp="test:",
+        )
+
+
+def _session_with_reset_reader(reset: asyncio.Event):
+    from cync_lan.devices import CyncTCPSession
+
+    async def read(_chunk):
+        await reset.wait()
+        raise ConnectionResetError(104, "reset by peer")
+
+    reader = MagicMock()
+    reader.at_eof.return_value = False
+    reader.read = read
+    session = CyncTCPSession(reader=reader, writer=MagicMock(), ip_address="127.0.0.1")
+    session.close = AsyncMock()
+    return session
+
+
+async def test_receive_task_closes_the_session_when_the_read_fails():
+    """#22: the loop used to exit without closing, leaving a dead session in
+    the broadcast pool and its device marked online for many minutes."""
+    reset = asyncio.Event()
+    session = _session_with_reset_reader(reset)
+    session.tasks.receive = asyncio.create_task(session.receive_task())
+
+    reset.set()
+    await session.tasks.receive
+    await asyncio.sleep(0)
+
+    session.close.assert_awaited_once()
+
+
+async def test_stale_receive_task_leaves_a_reconnected_session_open():
+    """A reconnect swaps a new socket into the same session and replaces its
+    tasks. The old loop failing afterwards must not close the new connection."""
+    reset = asyncio.Event()
+    session = _session_with_reset_reader(reset)
+    stale = asyncio.create_task(session.receive_task())
+    session.tasks.receive = stale
+    await asyncio.sleep(0)
+    session.tasks.receive = MagicMock()
+
+    reset.set()
+    await stale
+    await asyncio.sleep(0)
+
+    session.close.assert_not_awaited()
 
 
 async def test_parse_83_device_state_records_relay_source():

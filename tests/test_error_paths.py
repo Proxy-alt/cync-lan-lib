@@ -10,7 +10,6 @@ from __future__ import annotations
 import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
-import aiohttp
 import pytest
 
 from cync_lan.cloud_api import CyncCloudAPI
@@ -41,18 +40,50 @@ async def test_send_tkn_post_returns_false_on_non_http_errors(exc):
     assert await api._send_tkn_post("https://example.invalid/token", {}) is False
 
 
+def _error_response(status: int, body: str) -> MagicMock:
+    resp = MagicMock()
+    resp.ok = False
+    resp.status = status
+    resp.text = AsyncMock(return_value=body)
+    return resp
+
+
 async def test_send_tkn_post_returns_false_on_http_error():
     api = CyncCloudAPI(session=MagicMock())
-    resp = MagicMock()
-    resp.raise_for_status = MagicMock(
-        side_effect=aiohttp.ClientResponseError(
-            request_info=MagicMock(), history=(), status=401
-        )
-    )
     api.http_session = MagicMock()
-    api.http_session.post = AsyncMock(return_value=resp)
+    api.http_session.post = AsyncMock(return_value=_error_response(401, ""))
 
     assert await api._send_tkn_post("https://example.invalid/token", {}) is False
+
+
+async def test_auth_failure_logs_the_vendors_reason(caplog):
+    """Proxy-alt/cync-lan#51: every OTP rejection logged as a bare 400, and
+    the body that says which 400 it was had already been released."""
+    api = CyncCloudAPI(session=MagicMock())
+    api.http_session = MagicMock()
+    api.http_session.post = AsyncMock(
+        return_value=_error_response(
+            400, '{"error": {"msg": "password error", "code": 4001007}}'
+        )
+    )
+
+    with caplog.at_level("ERROR"):
+        ok = await api._send_tkn_post("https://example.invalid/token", {})
+
+    assert ok is False
+    assert "HTTP 400: password error (code 4001007)" in caplog.text
+
+
+async def test_an_unexpected_error_body_is_logged_raw(caplog):
+    api = CyncCloudAPI(session=MagicMock())
+    api.http_session = MagicMock()
+    api.http_session.post = AsyncMock(
+        return_value=_error_response(502, "<html>Bad Gateway</html>")
+    )
+
+    with caplog.at_level("ERROR"):
+        assert await api._send_tkn_post("https://example.invalid/token", {}) is False
+    assert "HTTP 502: <html>Bad Gateway</html>" in caplog.text
 
 
 def _mitm_session() -> CyncTCPSession:

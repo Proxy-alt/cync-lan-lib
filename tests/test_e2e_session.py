@@ -71,11 +71,8 @@ async def _serve(certs: tuple[str, str]) -> tuple[nCyncServer, int, asyncio.Task
 async def _shutdown(server: nCyncServer, task: asyncio.Task) -> None:
     sessions = list(server.tcp_connections.values())
     for session in sessions:
-        # stop_proxy() before close(): close() does not tear the cloud
-        # connection down, and a relay left open keeps the fake cloud's
-        # handler in read() forever.
-        with contextlib.suppress(Exception):
-            await session.stop_proxy()
+        # close() tears the cloud relay down too - see
+        # test_closing_a_passthrough_session_hangs_up_on_the_cloud.
         with contextlib.suppress(Exception):
             await session.close()
     server._server.close()
@@ -405,6 +402,58 @@ async def test_passthrough_comes_back_when_the_cloud_does(
         await _shutdown(server, task)
 
 
+async def test_closing_a_passthrough_session_hangs_up_on_the_cloud(
+    real_sockets, certs, monkeypatch, tmp_path
+):
+    """close() used to leave the relay running. Proxy-alt/cync-lan-lib#24.
+
+    The cloud then believed the device was still connected and routed app
+    commands into a session with no device behind it, and the next packet
+    it sent crashed the relay on the nulled writer, which turned passthrough
+    off. A closed session must hang up on the cloud and still be ready to
+    relay again when the device comes back.
+    """
+    monkeypatch.setattr(
+        "cync_lan.devices.CYNC_MITM_LOG_DIR", str(tmp_path / "mitm"), raising=False
+    )
+    monkeypatch.setenv("CYNC_CLOUD_PASSTHROUGH", "1")
+    monkeypatch.setenv("CYNC_CLOUD_IP", "127.0.0.1")
+    async with FakeCloud(*certs) as cloud:
+        monkeypatch.setenv("CYNC_CLOUD_PORT", str(cloud.port))
+        server, port, task = await _serve(certs)
+        try:
+            auth = build_23_auth()
+            async with VirtualCyncDevice("127.0.0.1", port) as device:
+                await device.send(auth)
+                assert await cloud.wait_for_bytes(len(auth))
+                session = server.tcp_connections["127.0.0.1"]
+                await session.close()
+
+                assert session.tasks.proxy_task is None
+                assert session.cloud_writer is None
+                cloud_side = cloud._peers[0]
+                for _ in range(50):
+                    if cloud_side.is_closing():
+                        break
+                    await asyncio.sleep(0.05)
+                assert cloud_side.is_closing(), (
+                    "the cloud still holds a connection for a closed session"
+                )
+                # Still a passthrough session - only the connection ended.
+                assert session.mitm_mode is True
+                assert session.passthrough is True
+
+            async with VirtualCyncDevice("127.0.0.1", port) as device:
+                await device.send(auth)
+                assert await cloud.wait_for_bytes(2 * len(auth)), (
+                    "the reconnected device was not relayed"
+                )
+                assert cloud.connections == 2
+                assert server.tcp_connections["127.0.0.1"].passthrough is True
+        finally:
+            await _shutdown(server, task)
+
+
 async def test_a_capture_session_is_left_alone_when_the_cloud_dies(
     real_sockets, certs, monkeypatch, tmp_path
 ):
@@ -491,3 +540,76 @@ async def test_an_unwritable_capture_log_does_not_cost_the_device(
                 assert await cloud.wait_for_bytes(1)
         finally:
             await _shutdown(server, task)
+
+
+async def test_concurrent_commands_to_a_dropped_bridge_do_not_crash(
+    real_sockets, certs, monkeypatch
+):
+    """#20: a light group fans one service call out to every member at once,
+    so two commands can land on the same bridge just after it lost power.
+    The first write removes the session; the second must not crash on the
+    None that remove_tcp_device() then returns."""
+    from cync_lan.devices import broadcast_control_command
+    from cync_lan.structs import ControlMessageCallback
+
+    monkeypatch.setenv("CYNC_CLOUD_PASSTHROUGH", "0")
+    server, port, task = await _serve(certs)
+    try:
+        async with VirtualCyncDevice("127.0.0.1", port) as device:
+            await device.send(build_23_auth())
+            assert await device.read_until(0xA3) is not None
+            session = server.tcp_connections["127.0.0.1"]
+            assert session.ready_to_control is True
+
+            # The transport is going away, but nothing has called close() yet.
+            session.writer.transport.abort()
+            assert session.writer.is_closing() and not session.is_closed()
+
+            def command():
+                m_cb = ControlMessageCallback(
+                    msg_id=0, message=None, sent_at=0.0, callback=None
+                )
+                return broadcast_control_command(
+                    op=0xD0,
+                    cmd_=0x0D,
+                    target_id=5,
+                    sub_id=0,
+                    payload=b"",
+                    m_cb=m_cb,
+                    lp="test:",
+                )
+
+            await asyncio.gather(command(), command())
+
+            assert "127.0.0.1" not in server.tcp_connections
+    finally:
+        await _shutdown(server, task)
+
+
+async def test_a_device_reset_takes_its_session_out_of_the_pool(
+    real_sockets, certs, monkeypatch
+):
+    """#22: a device resetting its connection must leave the broadcast pool
+    straight away, not whenever a later write happens to notice."""
+    monkeypatch.setenv("CYNC_CLOUD_PASSTHROUGH", "0")
+    server, port, task = await _serve(certs)
+    try:
+        async with VirtualCyncDevice("127.0.0.1", port) as device:
+            await device.send(build_23_auth())
+            assert await device.read_until(0xA3) is not None
+            # The MeshInfo request is the last write the handshake makes. A
+            # write after the reset would clean up on its own and hide #22.
+            assert await device.read_until(0x73) is not None
+            session = server.tcp_connections["127.0.0.1"]
+            assert server.get_dev_tcp_pool_sync() == [session]
+
+            device.writer.transport.abort()
+            for _ in range(40):
+                if session.is_closed():
+                    break
+                await asyncio.sleep(0.05)
+
+            assert session.is_closed(), "dead session was left open"
+            assert server.get_dev_tcp_pool_sync() == []
+    finally:
+        await _shutdown(server, task)

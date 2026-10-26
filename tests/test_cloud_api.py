@@ -335,11 +335,10 @@ async def test_parse_raw_export_no_schedules_key_gets_empty_dict():
 
 
 class _FakeTokenResponse:
+    ok = True
+
     def __init__(self, payload):
         self._payload = payload
-
-    def raise_for_status(self):
-        return None
 
     async def json(self):
         return self._payload

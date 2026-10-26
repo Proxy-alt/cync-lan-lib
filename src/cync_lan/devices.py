@@ -36,13 +36,13 @@ from cync_lan.const import (
     STREAM_CHUNK_SIZE,
     TCP_BLACKHOLE_DELAY,
 )
+from cync_lan.logfiles import make_capture_handler, prune_old_logs
 from cync_lan.metadata.model_info import (
     MULTI_ENDPOINT_TYPES,
     DeviceClassification,
     DeviceTypeInfo,
     device_type_map,
 )
-from cync_lan.logfiles import make_capture_handler, prune_old_logs
 from cync_lan.packet import PacketBuilder
 from cync_lan.structs import (
     CacheData,
@@ -663,7 +663,12 @@ async def broadcast_control_command(
                     logger.debug(f"{lp} Sending{str_appnd}")
 
     if tasks:
-        await asyncio.gather(*tasks)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        failures = [r for r in results if isinstance(r, BaseException)]
+        for exc in failures:
+            logger.warning(f"{lp} write to a bridge failed: {exc!r}")
+        if len(failures) == len(results):
+            raise failures[0]
         return True
     return False
 
@@ -5119,6 +5124,10 @@ class CyncTCPSession:
                             f"{lp} read() returned False, exiting {name} "
                             f"(started at: {datetime.datetime.fromtimestamp(started_at)})..."
                         )
+                        # A reconnect can swap a new socket into this session (#22)
+                        owns_session = self.tasks.receive is asyncio.current_task()
+                        if owns_session and not self.is_closed():
+                            asyncio.create_task(self.close())
                         break
                     if not data:
                         await asyncio.sleep(0)
@@ -5196,8 +5205,10 @@ class CyncTCPSession:
                                 f"the device itself hasn't called close(). The device probably "
                                 f"dropped the connection (lost power). Removing {self.ip_address}"
                             )
+                            # None when a concurrent write already removed it (#20)
                             off_dev = await g.ncync_server.remove_tcp_device(self)
-                            asyncio.create_task(off_dev.close())
+                            if off_dev is not None:
+                                asyncio.create_task(off_dev.close())
 
                         else:
                             logger.debug(
@@ -5227,6 +5238,20 @@ class CyncTCPSession:
             await self.tasks.cancel_all()
         except Exception as e:
             logger.exception(f"{lp} Exception during device task .cancel_all(): {e}")
+        # The cloud relay is not among the tasks cancel_all() iterates, so it
+        # outlived every close(). The cloud kept a live connection for a device
+        # that was gone and went on routing app commands into it - lost, or
+        # delivered only once the device reconnected - and the first packet it
+        # relayed hit the writer nulled below ("Error in cloud proxy:
+        # 'NoneType' object has no attribute 'write'"), which then switched
+        # passthrough off as if the cloud had died. Proxy-alt/cync-lan-lib#24.
+        #
+        # stop_proxy() leaves mitm_mode and passthrough alone, so a reconnect
+        # through existing_init() opens a fresh relay for the new handshake.
+        try:
+            await self.stop_proxy()
+        except Exception as e:
+            logger.exception(f"{lp} Exception stopping the cloud relay: {e}")
         try:
             if self.writer:
                 async with self.write_lock:
