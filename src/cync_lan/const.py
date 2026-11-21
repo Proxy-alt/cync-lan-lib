@@ -68,7 +68,11 @@ __all__ = [
 ]
 
 YES_ANSWER = ("true", "1", "yes", "y", "t", 1, "on", "o")
-LOCAL_TZ = zoneinfo.ZoneInfo(str(tzlocal.get_localzone()))
+try:
+    tz_str = str(tzlocal.get_localzone())
+    LOCAL_TZ = zoneinfo.ZoneInfo(tz_str if tz_str != "local" else "UTC")
+except Exception:
+    LOCAL_TZ = zoneinfo.ZoneInfo("UTC")
 CYNC_LOG_NAME: str = "cync_lan"
 
 LOG_FORMATTER = logging.Formatter(
