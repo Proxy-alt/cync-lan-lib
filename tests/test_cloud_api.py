@@ -649,3 +649,174 @@ async def test_a_password_is_truncated_but_never_trimmed(_credentials, monkeypat
         _credentials.with_credentials("u@e.com", "MyPasswordIsCool "),
     )
     assert sent["password"] == "MyPasswordIsCool", "only the 17th character goes"
+
+
+@pytest.mark.parametrize(
+    "home_id",
+    [123456789, 1234567895, "1234567895", None, ""],
+    ids=[
+        "nine-digit",
+        "ten-digit",
+        "string-id",
+        "legacy-export",
+        "empty-home-id",
+    ],
+)
+async def test_parse_raw_export_variable_length_home_id(home_id, tmp_path):
+    """Multi-outlet devices must support variable-length home IDs."""
+    api = CyncCloudAPI(config=CyncConfig(config_dir=str(tmp_path)))
+
+    def make_device(suffix, name, device_type, firmware="1.2.313"):
+        return {
+            "deviceID": int(f"{home_id or 123456789}{suffix}"),
+            "displayName": name,
+            "deviceType": device_type,
+            "firmwareVersion": firmware,
+            "mac": "02:00:00:00:00:01",
+            "wifiMac": "02:00:00:00:00:02",
+        }
+
+    home = {
+        "id": home_id,
+        "name": "Test Home",
+        "properties": {
+            "bulbsArray": [
+                make_device("001001", "Outlet A1", 67, ""),
+                make_device("002001", "Outlet A2", 67, ""),
+                make_device("001", "Outdoor Plug A", 67),
+                make_device("001002", "Outlet B1", 67, ""),
+                make_device("002002", "Outlet B2", 67, ""),
+                make_device("002", "Outdoor Plug B", 67),
+                make_device("043", "Indoor Plug", 68, "1.0.386"),
+            ],
+            "groupsArray": [],
+        },
+    }
+
+    if home_id is None:
+        del home["id"]
+
+    result = await api._parse_raw_export([home])
+    devices = result["exported_homes"]["Test Home"]["devices"]
+
+    assert set(devices) == {1, 2, 43}
+
+    assert devices[1]["endpoints"] == {
+        1: "Outlet A1",
+        2: "Outlet A2",
+    }
+
+    assert devices[2]["endpoints"] == {
+        1: "Outlet B1",
+        2: "Outlet B2",
+    }
+
+    assert devices[43]["endpoints"] == {
+        0: "Indoor Plug",
+    }
+
+
+@pytest.mark.parametrize(
+    "invalid_id",
+    [
+        "9876543215001",
+        "123456789501",
+        "1234567895abc",
+    ],
+    ids=["wrong-prefix", "short-suffix", "nonnumeric-suffix"],
+)
+async def test_parse_raw_export_invalid_device_id(invalid_id, tmp_path, caplog):
+    """Malformed identifiers must not prevent valid devices from importing."""
+    api = CyncCloudAPI(config=CyncConfig(config_dir=str(tmp_path)))
+
+    valid_device = {
+        "deviceID": 1234567895043,
+        "displayName": "Indoor Plug",
+        "deviceType": 68,
+        "firmwareVersion": "1.0.386",
+        "mac": "02:00:00:00:00:01",
+        "wifiMac": "02:00:00:00:00:02",
+    }
+
+    invalid_device = {
+        **valid_device,
+        "deviceID": invalid_id,
+        "displayName": "Invalid Device",
+    }
+
+    home = {
+        "id": 1234567895,
+        "name": "Test Home",
+        "properties": {
+            "bulbsArray": [invalid_device, valid_device],
+            "groupsArray": [],
+        },
+    }
+
+    result = await api._parse_raw_export([home])
+    devices = result["exported_homes"]["Test Home"]["devices"]
+
+    assert set(devices) == {43}
+    assert devices[43]["endpoints"] == {0: "Indoor Plug"}
+
+    assert any(
+        "Device ID does not match its home ID" in message
+        or "Invalid device ID suffix" in message
+        for message in caplog.messages
+    )
+
+
+async def test_parse_raw_export_genuine_duplicate_endpoint(tmp_path, caplog):
+    """Genuine duplicates must not overwrite valid outlet definitions."""
+    api = CyncCloudAPI(config=CyncConfig(config_dir=str(tmp_path)))
+
+    parent = {
+        "deviceID": 1234567895001,
+        "displayName": "Outdoor Plug",
+        "deviceType": 67,
+        "firmwareVersion": "1.2.313",
+        "mac": "02:00:00:00:00:01",
+        "wifiMac": "02:00:00:00:00:02",
+    }
+
+    outlet_one = {
+        **parent,
+        "deviceID": 1234567895001001,
+        "displayName": "Outlet 1",
+        "firmwareVersion": "",
+    }
+
+    outlet_two = {
+        **outlet_one,
+        "deviceID": 1234567895002001,
+        "displayName": "Outlet 2",
+    }
+
+    duplicate = {
+        **outlet_one,
+        "displayName": "Duplicate Outlet",
+    }
+
+    home = {
+        "id": 1234567895,
+        "name": "Test Home",
+        "properties": {
+            "bulbsArray": [
+                outlet_one,
+                duplicate,
+                outlet_two,
+                parent,
+            ],
+            "groupsArray": [],
+        },
+    }
+
+    result = await api._parse_raw_export([home])
+    devices = result["exported_homes"]["Test Home"]["devices"]
+
+    assert devices[1]["endpoints"] == {
+        1: "Outlet 1",
+        2: "Outlet 2",
+    }
+
+    assert "Duplicate sub-device ID 1" in caplog.text
