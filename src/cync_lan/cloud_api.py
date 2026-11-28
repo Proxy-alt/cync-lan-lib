@@ -899,8 +899,24 @@ class CyncCloudAPI:
                 # currently used by cync-lan - devices are already keyed by their own
                 # dev_id, not by which hub they're wired through.
                 raw_id = str(raw_device["deviceID"])
-                home_id = raw_id[:9]
-                raw_dev = raw_id.split(home_id)[1]
+                # Home IDs are not always nine digits long.
+                # Use the exported home ID when available, retaining
+                # the legacy prefix length for exports without an ID.
+                exported_home_id = raw_home.get("id")
+                home_id = (
+                    str(exported_home_id)
+                    if exported_home_id is not None
+                    else raw_id[:9]
+                )
+                if not raw_id.startswith(home_id):
+                    logger.warning(
+                        f"{lp} Device ID does not match its home ID, skipping..."
+                    )
+                    continue
+                raw_dev = raw_id[len(home_id) :]
+                if len(raw_dev) < 3 or not raw_dev.isascii() or not raw_dev.isdigit():
+                    logger.warning(f"{lp} Invalid device ID suffix, skipping...")
+                    continue
                 dev_id = int(raw_dev[-3:])
                 sub_id = 0
                 # Seems the thermostat has a multi-endpoint deviceID but is a single entry
