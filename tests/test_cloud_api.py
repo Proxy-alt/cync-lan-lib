@@ -653,8 +653,14 @@ async def test_a_password_is_truncated_but_never_trimmed(_credentials, monkeypat
 
 @pytest.mark.parametrize(
     "home_id",
-    [123456789, 1234567895, "1234567895", None],
-    ids=["nine-digit", "ten-digit", "string-id", "legacy-export"],
+    [123456789, 1234567895, "1234567895", None, ""],
+    ids=[
+        "nine-digit",
+        "ten-digit",
+        "string-id",
+        "legacy-export",
+        "empty-home-id",
+    ],
 )
 async def test_parse_raw_export_variable_length_home_id(home_id, tmp_path):
     """Multi-outlet devices must support variable-length home IDs."""

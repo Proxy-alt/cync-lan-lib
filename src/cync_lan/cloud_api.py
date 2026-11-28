@@ -905,7 +905,7 @@ class CyncCloudAPI:
                 exported_home_id = raw_home.get("id")
                 home_id = (
                     str(exported_home_id)
-                    if exported_home_id is not None
+                    if exported_home_id not in (None, "")
                     else raw_id[:9]
                 )
                 if not raw_id.startswith(home_id):
